@@ -33,6 +33,23 @@ def load_checkpoint(
     opt,
     scaler,
 ):
+    """
+    Loads a checkpoint from file and loads the weights into the encoder and predictor.
+
+    Args:
+        r_path (str): the path to the checkpoint to load.
+        encoder (nn.Module): the encoder to load the weights into.
+        predictor (nn.Module): the predictor to load the weights into.
+        target_encoder (nn.Module, optional): an optional target encoder to load
+            the weights into.
+        opt (torch.optim.Optimizer): the optimizer to load the weights into.
+        scaler (torch.cuda.amp.GradScaler, optional): an optional amp scaler to
+            load the weights into.
+
+    Returns:
+        tuple: a tuple containing the loaded encoder, predictor, target_encoder,
+            optimizer, scaler, and the epoch at which the checkpoint was saved.
+    """
     try:
         checkpoint = torch.load(r_path, map_location=torch.device('cpu'))
     except Exception as e:
@@ -98,6 +115,29 @@ def init_video_model(
     zero_init_mask_tokens=True,
     use_sdpa=False,
 ):
+    """
+    Initialize a video model with a VisionTransformer as backbone and a
+    VisionTransformerPredictor as predictor.
+
+    Args:
+        device: The device to move the model to.
+        patch_size: The patch size to use for the VisionTransformer.
+        num_frames: The number of frames to use for the VisionTransformer.
+        tubelet_size: The tubelet size to use for the VisionTransformer.
+        model_name: The name of the VisionTransformer model to use.
+        crop_size: The crop size to use for the VisionTransformer.
+        pred_depth: The depth of the VisionTransformerPredictor.
+        pred_embed_dim: The embedding dimension of the VisionTransformerPredictor.
+        uniform_power: Whether to use uniform power in the VisionTransformer.
+        use_mask_tokens: Whether to use mask tokens in the VisionTransformer.
+        num_mask_tokens: The number of mask tokens to use in the VisionTransformer.
+        zero_init_mask_tokens: Whether to zero initialize the mask tokens in the VisionTransformer.
+        use_sdpa: Whether to use SDPA in the VisionTransformer.
+
+    Returns:
+        A tuple containing the initialized VisionTransformer and
+        VisionTransformerPredictor.
+    """
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
         patch_size=patch_size,

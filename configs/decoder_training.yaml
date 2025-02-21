@@ -1,0 +1,19 @@
+model:
+  # Decoder specific configs inherited from main config
+
+training:
+  lr: 1e-4
+  weight_decay: 0.05
+  num_epochs: 100
+  batch_size: 32
+
+mask:
+  # Masking strategy configs inherited from main config
+
+logging:
+  use_wandb: true
+  project_name: "vjepa_decoder"
+  vis_interval: 100  # Log visualizations every N batches
+
+checkpoints:
+  path: "checkpoints/decoder" 

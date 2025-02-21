@@ -311,6 +311,28 @@ def run_one_epoch(
     attend_across_segments,
 ):
 
+    """
+    Run a single epoch for training or evaluation.
+
+    Args:
+        device (torch.device): The device on which to run the computations.
+        training (bool): Flag indicating whether the epoch is for training or evaluation.
+        encoder (nn.Module): The encoder model to process input data.
+        classifier (nn.Module): The classifier model to make predictions.
+        scaler (torch.cuda.amp.GradScaler): Scaler for mixed precision training.
+        optimizer (torch.optim.Optimizer): Optimizer for model parameters.
+        scheduler (torch.optim.lr_scheduler._LRScheduler): Learning rate scheduler.
+        wd_scheduler (torch.optim.lr_scheduler._LRScheduler): Weight decay scheduler.
+        data_loader (DataLoader): DataLoader providing input data and labels.
+        use_bfloat16 (bool): Whether to use bfloat16 precision.
+        num_spatial_views (int): Number of spatial views of the input.
+        num_temporal_views (int): Number of temporal views of the input.
+        attend_across_segments (bool): Whether to attend across segments.
+
+    Returns:
+        float: The average top-1 accuracy for the epoch.
+    """
+
     classifier.train(mode=training)
     criterion = torch.nn.CrossEntropyLoss()
     top1_meter = AverageMeter()
@@ -387,6 +409,21 @@ def load_checkpoint(
     opt,
     scaler
 ):
+    """
+    Loads a checkpoint from file and loads the weights into the encoder and predictor.
+
+    Args:
+        device (torch.device): The device on which to run the computations.
+        r_path (str): the path to the checkpoint to load.
+        classifier (nn.Module): the classifier to load the weights into.
+        opt (torch.optim.Optimizer): the optimizer to load the weights into.
+        scaler (torch.cuda.amp.GradScaler, optional): an optional amp scaler to
+            load the weights into.
+
+    Returns:
+        tuple: a tuple containing the loaded encoder, predictor, optimizer, scaler,
+            and the epoch at which the checkpoint was saved.
+    """
     try:
         checkpoint = torch.load(r_path, map_location=torch.device('cpu'))
         epoch = checkpoint['epoch']
@@ -416,6 +453,18 @@ def load_pretrained(
     pretrained,
     checkpoint_key='target_encoder'
 ):
+    """
+    Loads a checkpoint from file and loads the weights into the encoder.
+
+    Args:
+        encoder (nn.Module): the encoder to load the weights into.
+        pretrained (str): the path to the checkpoint to load.
+        checkpoint_key (str, optional): the key to access the encoder state in the checkpoint.
+            Defaults to 'target_encoder'.
+
+    Returns:
+        nn.Module: the loaded encoder.
+    """
     logger.info(f'Loading pretrained model from {pretrained}')
     checkpoint = torch.load(pretrained, map_location='cpu')
     try:
@@ -457,6 +506,41 @@ def make_dataloader(
     subset_file=None
 ):
     # Make Video Transforms
+    """
+    Creates a data loader for the specified dataset and transformations.
+
+    Args:
+        root_path (str): The root path where the dataset is stored.
+        batch_size (int): The number of samples per batch.
+        world_size (int): The number of processes participating in the job.
+        rank (int): The rank of the current process.
+        dataset_type (str, optional): The type of the dataset to use.
+            Defaults to 'VideoDataset'.
+        resolution (int, optional): The resolution of the input images.
+            Defaults to 224.
+        frames_per_clip (int, optional): The number of frames in each clip.
+            Defaults to 16.
+        frame_step (int, optional): The step size between frames in each clip.
+            Defaults to 4.
+        num_segments (int, optional): The number of segments per video.
+            Defaults to 8.
+        eval_duration (int, optional): The duration of the evaluation clips.
+            Defaults to None.
+        num_views_per_segment (int, optional): The number of views per segment.
+            Defaults to 1.
+        allow_segment_overlap (bool, optional): Whether to allow segment overlap.
+            Defaults to True.
+        training (bool, optional): Whether the data loader is for training.
+            Defaults to False.
+        num_workers (int, optional): The number of workers for the data loader.
+            Defaults to 12.
+        subset_file (str, optional): The path to a file specifying a subset of
+            the dataset. Defaults to None.
+
+    Returns:
+        DataLoader: A PyTorch DataLoader for the specified dataset and
+            transformations.
+    """
     transform = make_transforms(
         training=training,
         num_views_per_clip=num_views_per_segment,
@@ -503,6 +587,27 @@ def init_model(
     uniform_power=False,
     checkpoint_key='target_encoder'
 ):
+    """
+    Initialize a Vision Transformer model for video classification.
+
+    Args:
+        device: The device to which the model should be moved (e.g., 'cpu', 'cuda').
+        pretrained: Path to the pretrained model checkpoint.
+        model_name: The name of the Vision Transformer model to use.
+        patch_size: The size of each patch in the input image.
+        crop_size: The crop size of the input image.
+        frames_per_clip: Number of frames per video clip for the model input.
+        tubelet_size: The tubelet size used for the model input.
+        use_sdpa: Whether to use scaled dot-product attention.
+        use_SiLU: Whether to use SiLU activation function.
+        tight_SiLU: Whether to use a tighter version of SiLU.
+        uniform_power: Whether to use uniform power normalization.
+        checkpoint_key: Key to access the encoder state in the checkpoint.
+
+    Returns:
+        An initialized Vision Transformer model with loaded pretrained weights.
+    """
+    
     encoder = vit.__dict__[model_name](
         img_size=crop_size,
         patch_size=patch_size,

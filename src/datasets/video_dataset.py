@@ -46,6 +46,35 @@ def make_videodataset(
     duration=None,
     log_dir=None,
 ):
+    """
+    Creates a VideoDataset and corresponding DataLoader with distributed sampling.
+
+    Args:
+        data_paths (list of str): Paths to video data files.
+        batch_size (int): Number of samples per batch.
+        frames_per_clip (int, optional): Number of frames in each video clip. Defaults to 8.
+        frame_step (int, optional): Step size between frames in each clip. Defaults to 4.
+        num_clips (int, optional): Number of clips to sample from each video. Defaults to 1.
+        random_clip_sampling (bool, optional): Whether to randomly sample clips. Defaults to True.
+        allow_clip_overlap (bool, optional): Whether to allow overlapping clips. Defaults to False.
+        filter_short_videos (bool, optional): Whether to filter out short videos. Defaults to False.
+        filter_long_videos (int, optional): Maximum allowed video duration in seconds. Defaults to large value.
+        transform (callable, optional): Function/transform to apply to each clip.
+        shared_transform (callable, optional): Transform to be applied to all clips.
+        rank (int, optional): Rank of the current process for distributed training. Defaults to 0.
+        world_size (int, optional): Number of processes for distributed training. Defaults to 1.
+        datasets_weights (list of float, optional): Weights for each dataset for sampling.
+        collator (callable, optional): Function to collate samples into batches.
+        drop_last (bool, optional): Whether to drop the last incomplete batch. Defaults to True.
+        num_workers (int, optional): Number of subprocesses for data loading. Defaults to 10.
+        pin_mem (bool, optional): Whether to use pinned memory for data loading. Defaults to True.
+        duration (int, optional): Duration in seconds to filter videos. Defaults to None.
+        log_dir (str, optional): Directory for logging information. Defaults to None.
+
+    Returns:
+        tuple: A tuple containing the VideoDataset, DataLoader, and DistributedSampler.
+    """
+
     dataset = VideoDataset(
         data_paths=data_paths,
         datasets_weights=datasets_weights,
@@ -106,6 +135,27 @@ class VideoDataset(torch.utils.data.Dataset):
         filter_long_videos=int(10**9),
         duration=None,  # duration in seconds
     ):
+        """
+        Initialize VideoDataset.
+
+        Args:
+            data_paths (list): List of paths to csv files containing video paths and labels.
+            datasets_weights (list, optional): List of weights for each dataset, used by
+                downstream weighted video sampler. Defaults to None.
+            frames_per_clip (int, optional): Number of frames in each video clip. Defaults to 16.
+            frame_step (int, optional): Step size between frames in each clip. Defaults to 4.
+            num_clips (int, optional): Number of clips to sample from each video. Defaults to 1.
+            transform (callable, optional): Function to apply to each video clip. Defaults to None.
+            shared_transform (callable, optional): Function to apply to the video as a whole.
+                Defaults to None.
+            random_clip_sampling (bool, optional): Whether to sample random clips from each video.
+                Defaults to True.
+            allow_clip_overlap (bool, optional): Whether to allow overlapping clips. Defaults to False.
+            filter_short_videos (bool, optional): Whether to filter out videos that are shorter than
+                the specified duration. Defaults to False.
+            filter_long_videos (int, optional): Maximum length of videos in seconds. Defaults to 10**9.
+            duration (int, optional): Duration of the evaluation clips. Defaults to None.
+        """
         self.data_paths = data_paths
         self.datasets_weights = datasets_weights
         self.frames_per_clip = frames_per_clip
@@ -154,6 +204,24 @@ class VideoDataset(torch.utils.data.Dataset):
         self.labels = labels
 
     def __getitem__(self, index):
+        """
+        Retrieve a single video sample by index, apply transformations, and return its clips.
+
+        This method attempts to load a video sample, retrying with a new random index if 
+        the initial attempt fails to load a valid video. After a successful load, it applies 
+        shared and individual transformations to the video, splits it into clips, and returns 
+        the processed clips along with the corresponding label and clip indices.
+
+        Args:
+            index (int): Index of the video sample to retrieve.
+
+        Returns:
+            tuple: A tuple containing:
+                - buffer (list of tensors): List of transformed video clips.
+                - label (int): Label associated with the video.
+                - clip_indices (list): Indices of the frames in the original video.
+        """
+
         sample = self.samples[index]
 
         # Keep trying to load videos until you find a valid sample

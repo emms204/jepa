@@ -52,6 +52,20 @@ class VideoTransform(object):
                    (0.229, 0.224, 0.225))
     ):
 
+        """
+        Initializes the VideoTransform class with various transformation parameters.
+
+        Args:
+            random_horizontal_flip (bool): Enables random horizontal flipping of videos.
+            random_resize_aspect_ratio (tuple): Aspect ratio range for random resizing.
+            random_resize_scale (tuple): Scale range for random resizing.
+            reprob (float): Probability of applying random erasing.
+            auto_augment (bool): Enables auto augmentation.
+            motion_shift (bool): Enables motion shift in spatial transform.
+            crop_size (int): Size to crop the videos.
+            normalize (tuple): Mean and standard deviation for normalization.
+        """
+
         self.random_horizontal_flip = random_horizontal_flip
         self.random_resize_aspect_ratio = random_resize_aspect_ratio
         self.random_resize_scale = random_resize_scale
@@ -85,6 +99,23 @@ class VideoTransform(object):
 
     def __call__(self, buffer):
 
+        """
+        Applies a series of transformations to a buffer of video frames.
+
+        The sequence of operations is as follows:
+
+        1. If auto_augment is True, apply the autoaugment transform (a sequence of PIL transforms)
+        2. Convert the buffer to a tensor
+        3. Permute the buffer to C T H W
+        4. Apply the spatial transform (random resized crop with or without motion shift)
+        5. If random_horizontal_flip is True, apply horizontal flip with 0.5 probability
+        6. Normalize the buffer
+        7. If reprob > 0, apply the random eraser transform
+        8. Permute the buffer back to T H W C
+
+        :param buffer: The input buffer of video frames
+        :return: The transformed buffer
+        """
         if self.auto_augment:
             buffer = [transforms.ToPILImage()(frame) for frame in buffer]
             buffer = self.autoaug_transform(buffer)

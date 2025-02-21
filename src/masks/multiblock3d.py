@@ -27,6 +27,18 @@ class MaskCollator(object):
         patch_size=(16, 16),
         tubelet_size=2,
     ):
+        """
+        Initializes the MaskCollator with the specified configuration for mask generation.
+
+        Args:
+            cfgs_mask: A list of configuration dictionaries, each containing parameters
+                for creating a _MaskGenerator.
+            crop_size (tuple): The size of the crop (height, width) for the masks. Defaults to (224, 224).
+            num_frames (int): The number of frames for temporal masking. Defaults to 16.
+            patch_size (tuple): The size of each spatial patch (height, width). Defaults to (16, 16).
+            tubelet_size (int): The size of each tubelet for temporal patching. Defaults to 2.
+        """
+
         super(MaskCollator, self).__init__()
 
         self.mask_generators = []
@@ -51,6 +63,18 @@ class MaskCollator(object):
 
     def __call__(self, batch):
 
+        """
+        Collates a batch of samples and generates a set of masks for each sample in the batch.
+
+        Args:
+            batch: A list of samples to be collated.
+
+        Returns:
+            A tuple containing:
+                - collated_batch (list): A list of collated samples.
+                - collated_masks_enc (list of tensors): A list of tensors, each containing the indices of the context tokens.
+                - collated_masks_pred (list of tensors): A list of tensors, each containing the indices of the target tokens.
+        """
         batch_size = len(batch)
         collated_batch = torch.utils.data.default_collate(batch)
 
@@ -78,6 +102,21 @@ class _MaskGenerator(object):
         max_context_frames_ratio=1.0,
         max_keep=None,
     ):
+        """
+        Initialize a _MaskGenerator object.
+
+        Args:
+            crop_size (tuple of ints): The spatial size of the input video.
+            num_frames (int): The number of frames in the input video.
+            spatial_patch_size (tuple of ints): The size of the spatial patches.
+            temporal_patch_size (int): The size of the temporal patch.
+            spatial_pred_mask_scale (tuple of floats): The range of the spatial prediction mask scale.
+            temporal_pred_mask_scale (tuple of floats): The range of the temporal prediction mask scale.
+            aspect_ratio (tuple of floats): The range of the aspect ratio of the prediction mask.
+            npred (int): The number of prediction masks to generate.
+            max_context_frames_ratio (float): The maximum ratio of context frames to the total number of frames.
+            max_keep (int or None): The maximum number of patches to keep in context. If None, all patches are kept.
+        """
         super(_MaskGenerator, self).__init__()
         if not isinstance(crop_size, tuple):
             crop_size = (crop_size, ) * 2
@@ -111,6 +150,18 @@ class _MaskGenerator(object):
         aspect_ratio_scale
     ):
         # -- Sample temporal block mask scale
+        """
+        Sample the size of the prediction mask block.
+
+        Args:
+            generator (torch.Generator): The random number generator to use.
+            temporal_scale (tuple of floats): The range of the temporal scale of the prediction mask.
+            spatial_scale (tuple of floats): The range of the spatial scale of the prediction mask.
+            aspect_ratio_scale (tuple of floats): The range of the aspect ratio of the prediction mask.
+
+        Returns:
+            tuple of int: The size of the block, as (temporal, height, width).
+        """
         _rand = torch.rand(1, generator=generator).item()
         min_t, max_t = temporal_scale
         temporal_mask_scale = min_t + _rand * (max_t - min_t)
@@ -136,6 +187,15 @@ class _MaskGenerator(object):
         return (t, h, w)
 
     def _sample_block_mask(self, b_size):
+        """
+        Sample a block mask given its size.
+
+        Args:
+            b_size (tuple of int): The size of the block, as (temporal, height, width).
+
+        Returns:
+            torch.Tensor: A tensor of shape (T, H, W) where entries are 0 (masked) or 1 (unmasked).
+        """
         t, h, w = b_size
         top = torch.randint(0, self.height - h + 1, (1,))
         left = torch.randint(0, self.width - w + 1, (1,))

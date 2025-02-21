@@ -17,6 +17,26 @@ logger = getLogger()
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
     # Cut & paste from PyTorch official master until it's in a few official releases - RW
     # Method based on https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
+    """
+    Fills the input Tensor with values drawn from a truncated
+    normal distribution. The values are effectively drawn from the
+    normal distribution :math:`N(\\mu, \\sigma)`, but with all values
+    whose magnitude is greater than :math:`2` clipped to be within
+    :math:`(-2, 2)` in the range, i.e. :math:`[\\mu - 2 * \\sigma,
+    \\mu + 2 * \\sigma]`.
+
+    The method used is described in
+    https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
+
+    Note that this function does not support backpropagation.
+
+    Args:
+        tensor: the input tensor.
+        mean: the mean of the normal distribution
+        std: the standard deviation of the normal distribution
+        a: the minimum cutoff value
+        b: the maximum cutoff value
+    """
     def norm_cdf(x):
         # Computes standard normal cumulative distribution function
         return (1. + math.erf(x / math.sqrt(2.))) / 2.
@@ -47,6 +67,26 @@ def _no_grad_trunc_normal_(tensor, mean, std, a, b):
 
 def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
     # type: (Tensor, float, float, float, float) -> Tensor
+    """
+    Fills the input Tensor with values drawn from a truncated
+    normal distribution. The values are effectively drawn from
+    the range (a, b) where `b > a`.
+
+    The method used for generating the random values is based on
+    Marsaglia et al. "Evaluating the Normal Distribution", Journal of
+    Statistical Software, 2004, Vol. 11, Issue 5, pp 1-11.
+
+    Args:
+        tensor: an n-dimensional `torch.Tensor`
+        mean: the mean of the normal distribution
+        std: the standard deviation of the normal distribution
+        a: the minimum cutoff value
+        b: the maximum cutoff value
+
+    Examples:
+        >>> w = torch.empty(3, 5)
+        >>> trunc_normal_(w, mean=0, std=1, a=-2, b=2)
+    """
     return _no_grad_trunc_normal_(tensor, mean, std, a, b)
 
 

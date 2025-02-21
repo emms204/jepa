@@ -32,6 +32,13 @@ class FrameAggregation(nn.Module):
         use_pos_embed=False,
         attend_across_segments=False
     ):
+        """
+        Args:
+            model: The model to be wrapped.
+            max_frames: The maximum number of frames in a video.
+            use_pos_embed: Whether to use 1D-temporal position embeddings.
+            attend_across_segments: Whether to attend across segments using cross-attention.
+        """
         super().__init__()
         self.model = model
         self.embed_dim = embed_dim = model.embed_dim
@@ -50,6 +57,16 @@ class FrameAggregation(nn.Module):
 
         # TODO: implement attend_across_segments=False
         # num_clips = len(x)
+        """
+        Process each frame independently and concatenate all tokens.
+
+        Args:
+            x (list of Tensors): list of num_clips tensors of shape [B, C, T, H, W]
+            clip_indices (list of Tensors or None): indices of patch tokens to mask (remove)
+
+        Returns:
+            list of Tensors: list of num_views_per_clip tensors of shape [B, T*N, D]
+        """
         num_views_per_clip = len(x[0])
 
         # Concatenate views along batch dimension
@@ -96,6 +113,16 @@ class ClipAggregation(nn.Module):
         use_pos_embed=False,
         attend_across_segments=False
     ):
+        """
+        Initialize ClipAggregation module.
+
+        Args:
+            model (nn.Module): base Vision Transformer model
+            tubelet_size (int, optional): the size of each tubelet. Defaults to 2.
+            max_frames (int, optional): maximum number of frames to process. Defaults to 10000.
+            use_pos_embed (bool, optional): whether to use positional embedding. Defaults to False.
+            attend_across_segments (bool, optional): whether to attend across segments. Defaults to False.
+        """
         super().__init__()
         self.model = model
         self.tubelet_size = tubelet_size
@@ -113,6 +140,23 @@ class ClipAggregation(nn.Module):
             self.pos_embed.copy_(torch.from_numpy(sincos).float().unsqueeze(0))
 
     def forward(self, x, clip_indices=None):
+
+        """
+        Forward pass for processing video clips through the Vision Transformer model.
+
+        Args:
+            x (list of list of torch.Tensor): A nested list where each inner list contains
+                tensors representing different spatial and temporal views of a video clip.
+                Each tensor has shape (B, C, T, H, W).
+            clip_indices (list of torch.Tensor, optional): Indices of clips to be used 
+                for positional embedding. Each tensor should have shape (B, T // tubelet_size).
+
+        Returns:
+            list of torch.Tensor: If `attend_across_segments` is False, returns a list of
+                outputs for each view. If True, returns concatenated temporal outputs with
+                positional embeddings applied, for each view, with each tensor shaped as 
+                (B, T*num_clips*N, D).
+        """
 
         num_clips = len(x)
         num_views_per_clip = len(x[0])
@@ -173,6 +217,24 @@ def make_transforms(
                (0.229, 0.224, 0.225))
 ):
 
+    """
+    Create VideoTransform or EvalVideoTransform depending on the arguments.
+
+    Args:
+        training (bool): Whether to create a VideoTransform or EvalVideoTransform.
+        random_horizontal_flip (bool): Whether to randomly flip horizontally.
+        random_resize_aspect_ratio (tuple): Range of aspect ratios to randomly resize.
+        random_resize_scale (tuple): Range of scales to randomly resize.
+        reprob (float): Probability of random erasing.
+        auto_augment (bool): Whether to use RandAugment.
+        motion_shift (bool): Whether to perform motion shift.
+        crop_size (int): Short side size of the crop.
+        num_views_per_clip (int): Number of views per clip.
+        normalize (tuple): Mean and std of the normalization.
+
+    Returns:
+        VideoTransform or EvalVideoTransform.
+    """
     if not training and num_views_per_clip > 1:
         print('Making EvalVideoTransform, multi-view')
         _frames_augmentation = EvalVideoTransform(
@@ -212,6 +274,20 @@ class VideoTransform(object):
                    (0.229, 0.224, 0.225))
     ):
 
+        """
+        Initialize VideoTransform class with various transformation parameters.
+
+        Args:
+            training (bool): Whether to perform training transforms.
+            random_horizontal_flip (bool): Whether to randomly flip horizontally.
+            random_resize_aspect_ratio (tuple): Range of aspect ratios to randomly resize.
+            random_resize_scale (tuple): Range of scales to randomly resize.
+            reprob (float): Probability of random erasing.
+            auto_augment (bool): Whether to use RandAugment.
+            motion_shift (bool): Whether to perform motion shift.
+            crop_size (int): Short side size of the crop.
+            normalize (tuple): Mean and standard deviation for normalization.
+        """
         self.training = training
 
         short_side_size = int(crop_size * 256 / 224)
@@ -249,6 +325,23 @@ class VideoTransform(object):
         )
 
     def __call__(self, buffer):
+
+        """
+        Apply training or evaluation transformations to a video buffer.
+
+        If the instance is in evaluation mode, apply the evaluation transform
+        and return the transformed buffer. Otherwise, perform a series of 
+        transformations including converting frames to PIL images, applying 
+        auto-augmentation if enabled, converting images to tensors, normalizing,
+        spatially transforming the buffer, and optionally applying horizontal 
+        flip and random erasing.
+
+        Args:
+            buffer (list): A list of video frames.
+
+        Returns:
+            list: A list containing the transformed video buffer.
+        """
 
         if not self.training:
             return [self.eval_transform(buffer)]
@@ -292,6 +385,16 @@ class EvalVideoTransform(object):
         normalize=((0.485, 0.456, 0.406),
                    (0.229, 0.224, 0.225))
     ):
+        """
+        Initialize EvalVideoTransform with parameters for processing video clips.
+
+        Args:
+            num_views_per_clip (int): Number of spatial views to sample per video clip.
+            short_side_size (int): Target size for the short side after resizing.
+            normalize (tuple): Mean and standard deviation for normalization, with
+                            mean as the first element and std as the second element.
+        """
+
         self.views_per_clip = num_views_per_clip
         self.short_side_size = short_side_size
         self.spatial_resize = video_transforms.Resize(short_side_size, interpolation='bilinear')
@@ -303,6 +406,18 @@ class EvalVideoTransform(object):
     def __call__(self, buffer):
 
         # Sample several spatial views of each clip
+        """
+        Resizes the input video clip to a fixed short side size and then sample
+        multiple spatial views from it.
+
+        Args:
+            buffer (ndarray or tensor): Input video clip of shape (T, H, W, C)
+
+        Returns:
+            list of tensors: A list of length `self.views_per_clip`, each element
+                is a tensor of shape (C, T, H', W') where H' and W' are the height
+                and width of the resized video.
+        """
         buffer = np.array(self.spatial_resize(buffer))
         T, H, W, C = buffer.shape
 

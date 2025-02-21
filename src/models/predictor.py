@@ -45,6 +45,31 @@ class VisionTransformerPredictor(nn.Module):
         zero_init_mask_tokens=True,
         **kwargs
     ):
+        """
+        Args:
+            img_size: The size of the input image.
+            patch_size: The size of each patch in the input image.
+            num_frames: The number of frames to use for the input video.
+            tubelet_size: The tubelet size used for the input video.
+            embed_dim: The number of dimensions in the embedding space.
+            predictor_embed_dim: The embedding dimension of the predictor.
+            depth: The number of predictor blocks.
+            num_heads: The number of attention heads in each predictor block.
+            mlp_ratio: The ratio of the number of channels in the MLP
+                (hidden layer) to the embedding dimension.
+            qkv_bias: Whether to add a bias term to the query, key, and value
+                projection layers.
+            qk_scale: The scaling factor for the qk attention scores.
+            drop_rate: The dropout rate for the predictor blocks.
+            attn_drop_rate: The dropout rate for the attention weights.
+            norm_layer: The normalization layer to use.
+            init_std: The standard deviation of the truncation normal
+                initialization.
+            uniform_power: Whether to use uniform power normalization.
+            use_mask_tokens: Whether to use mask tokens.
+            num_mask_tokens: The number of mask tokens to use.
+            zero_init_mask_tokens: Whether to zero initialize the mask tokens.
+        """
         super().__init__()
         # Map input to predictor dimension
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
@@ -119,6 +144,17 @@ class VisionTransformerPredictor(nn.Module):
         self._rescale_blocks()
 
     def _init_pos_embed(self, pos_embed):
+        """
+        Initialize positional embedding for predictor.
+
+        Given a tensor `pos_embed` of shape [1, num_patches, embed_dim], compute
+        either 2D or 3D sine-cosine positional encoding based on whether the model
+        is processing video input. For video inputs, the encoding is 3D with
+        dimensions determined by the grid size and depth. For image inputs, the
+        encoding is 2D based only on the grid size.
+
+        The computed positional encodings are copied to the `pos_embed` tensor.
+        """
         embed_dim = pos_embed.size(-1)
         grid_size = self.input_size // self.patch_size
         if self.is_video:
@@ -144,6 +180,11 @@ class VisionTransformerPredictor(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def _rescale_blocks(self):
+        """
+        Rescale the weights of each layer in the predictor by a factor of
+        sqrt(2 * layer_id), following the recipe in the VisionTransformer paper.
+        This is used to prevent the weights from growing too large during training.
+        """
         def rescale(param, layer_id):
             param.div_(math.sqrt(2.0 * layer_id))
 
@@ -154,6 +195,24 @@ class VisionTransformerPredictor(nn.Module):
     def diffusion(self, x, noise_beta=(0.5, 1.0), steps=1000):
 
         # Prepare diffusion noise schedule
+        """
+        Apply a diffusion process to input features.
+
+        This function simulates a diffusion process on the input tensor `x` by adding
+        noise at each time step based on a noise schedule defined by `noise_beta`.
+        The diffusion process normalizes and perturbs the features, simulating a
+        gradual transformation over `steps` time steps.
+
+        Args:
+            x (torch.Tensor): Input tensor representing features to be diffused.
+            noise_beta (tuple, optional): A tuple containing the start and end values
+                for the noise schedule. Defaults to (0.5, 1.0).
+            steps (int, optional): The number of diffusion steps. Defaults to 1000.
+
+        Returns:
+            torch.Tensor: The diffused and noise-added version of the input tensor `x`.
+        """
+
         b1, b2 = noise_beta
         beta_scheduler = (b1 + i*(b2-b1)/steps for i in range(steps))
         alpha_scheduler = []

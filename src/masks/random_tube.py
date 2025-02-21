@@ -26,6 +26,18 @@ class MaskCollator(object):
         patch_size=(16, 16),
         tubelet_size=2,
     ):
+        """
+        Initialize the MaskCollator with a list of config dictionaries.
+
+        Args:
+            cfgs_mask (list): A list of config dictionaries for the mask
+                generators. Each config should contain a 'ratio' key with the
+                ratio of patches to remove.
+            crop_size (tuple): The spatial size of the cropped input data.
+            num_frames (int): The number of frames in the input data.
+            patch_size (tuple): The size of each patch in the input data.
+            tubelet_size (int): The size of each tubelet in the input data.
+        """
         super(MaskCollator, self).__init__()
 
         self.mask_generators = []
@@ -44,6 +56,21 @@ class MaskCollator(object):
             mask_generator.step()
 
     def __call__(self, batch):
+
+        """
+        Collates a batch of samples and generates a set of masks for each sample in the batch.
+
+        Args:
+            batch (list): A list of samples to be collated.
+
+        Returns:
+            tuple: A tuple containing:
+                - collated_batch (torch.Tensor): The collated batch of samples.
+                - collated_masks_enc (list of torch.Tensor): A list of tensors, each containing indices
+                of context tokens for each mask generator.
+                - collated_masks_pred (list of torch.Tensor): A list of tensors, each containing indices
+                of target tokens for each mask generator.
+        """
 
         batch_size = len(batch)
         collated_batch = torch.utils.data.default_collate(batch)
@@ -67,6 +94,16 @@ class _MaskGenerator(object):
         temporal_patch_size=2,
         ratio=0.9,
     ):
+        """
+        Initialize a _MaskGenerator object.
+
+        Args:
+            crop_size (tuple or int): The size of the cropped input data.
+            num_frames (int): The number of frames in the input data.
+            spatial_patch_size (tuple): The size of each patch in the input data.
+            temporal_patch_size (int): The size of each tubelet in the input data.
+            ratio (float): The ratio of patches to remove.
+        """
         super(_MaskGenerator, self).__init__()
         if not isinstance(crop_size, tuple):
             crop_size = (crop_size, ) * 2
@@ -93,6 +130,21 @@ class _MaskGenerator(object):
         return v
 
     def __call__(self, batch_size):
+        """
+        Generate a list of masks for each sample in the batch. The masks are used
+        to remove patches from the input data. The number of patches to remove
+        is determined by the `ratio` parameter. The patches are randomly selected
+        from the spatial and temporal dimensions of the input data.
+
+        Args:
+            batch_size (int): The batch size.
+
+        Returns:
+            collated_masks_enc (list of torch.Tensor): A list of tensors, each containing indices
+                of context tokens for each mask generator.
+            collated_masks_pred (list of torch.Tensor): A list of tensors, each containing indices
+                of target tokens for each mask generator.
+        """
         def sample_mask():
             mask = np.hstack([
                 np.zeros(self.num_patches_spatial - self.num_keep_spatial),

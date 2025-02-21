@@ -272,6 +272,25 @@ def run_one_epoch(
     use_bfloat16,
 ):
 
+    """
+    Runs a single training or evaluation epoch.
+
+    Args:
+        device (torch.device): The device to run the computations on.
+        training (bool): Flag indicating whether the epoch is for training or evaluation.
+        encoder (nn.Module): The encoder model used for feature extraction.
+        classifier (nn.Module): The classifier model used for classification.
+        scaler (torch.cuda.amp.GradScaler or None): The gradient scaler for mixed precision training.
+        optimizer (torch.optim.Optimizer): The optimizer for updating model parameters.
+        scheduler (torch.optim.lr_scheduler._LRScheduler): The learning rate scheduler.
+        wd_scheduler (torch.optim.lr_scheduler._LRScheduler): The weight decay scheduler.
+        data_loader (DataLoader): The data loader providing input data and labels.
+        use_bfloat16 (bool): Flag indicating whether to use bfloat16 mixed precision.
+
+    Returns:
+        float: The average top-1 accuracy for the epoch.
+    """
+
     classifier.train(mode=training)
     criterion = torch.nn.CrossEntropyLoss()
     top1_meter = AverageMeter()
@@ -353,6 +372,18 @@ def load_pretrained(
     pretrained,
     checkpoint_key='target_encoder'
 ):
+    """
+    Loads a checkpoint from file and loads the weights into the encoder.
+
+    Args:
+        encoder (nn.Module): the encoder to load the weights into.
+        pretrained (str): the path to the checkpoint to load.
+        checkpoint_key (str, optional): the key to access the encoder state in the checkpoint.
+            Defaults to 'target_encoder'.
+
+    Returns:
+        nn.Module: the loaded encoder.
+    """
     logger.info(f'Loading pretrained model from {pretrained}')
     checkpoint = torch.load(pretrained, map_location='cpu')
     try:
@@ -387,6 +418,24 @@ def make_dataloader(
     training=False,
     subset_file=None
 ):
+    """
+    Creates a data loader for image or video datasets with specified transformations.
+
+    Args:
+        dataset_name (str): The name of the dataset to use.
+        root_path (str): The root path where the dataset is stored.
+        image_folder (str): The folder containing the images.
+        batch_size (int): The number of samples per batch.
+        world_size (int): The number of processes participating in the job.
+        rank (int): The rank of the current process.
+        resolution (int, optional): The resolution of the input images. Defaults to 224.
+        training (bool, optional): Flag indicating whether to apply training transformations. Defaults to False.
+        subset_file (str, optional): Path to a file specifying a subset of the dataset. Defaults to None.
+
+    Returns:
+        DataLoader: A PyTorch DataLoader for the specified dataset and transformations.
+    """
+
     normalization = ((0.485, 0.456, 0.406),
                      (0.229, 0.224, 0.225))
     if training:
@@ -438,6 +487,27 @@ def init_model(
     uniform_power=False,
     checkpoint_key='target_encoder'
 ):
+    """
+    Initialize a Vision Transformer model for video classification.
+
+    Args:
+        device: The device to which the model should be moved (e.g., 'cpu', 'cuda').
+        pretrained: Path to the pretrained model checkpoint.
+        model_name: The name of the Vision Transformer model to use.
+        patch_size: The size of each patch in the input image.
+        crop_size: The crop size of the input image.
+        frames_per_clip: Number of frames per video clip for the model input.
+        tubelet_size: The tubelet size used for the model input.
+        use_sdpa: Whether to use scaled dot-product attention.
+        use_SiLU: Whether to use SiLU activation function.
+        tight_SiLU: Whether to use a tighter version of SiLU.
+        uniform_power: Whether to use uniform power normalization.
+        checkpoint_key: Key to access the encoder state in the checkpoint.
+
+    Returns:
+        An initialized Vision Transformer model with loaded pretrained weights.
+    """
+
     encoder = vit.__dict__[model_name](
         img_size=crop_size,
         patch_size=patch_size,
@@ -450,6 +520,18 @@ def init_model(
     )
     if frames_per_clip > 1:
         def forward_prehook(module, input):
+            """
+            A forward prehook for the Vision Transformer encoder that modifies the input tensor shape
+            to have frames_per_clip frames in the third dimension. This is used when the input is a single
+            image that is repeated frames_per_clip times to create a video-like input.
+
+            Args:
+                module: Unused argument.
+                input: The input tensor to the encoder, which is a single image.
+
+            Returns:
+                A modified input tensor with shape [B, C, frames_per_clip, H, W].
+            """
             input = input[0]  # [B, C, H, W]
             input = input.unsqueeze(2).repeat(1, 1, frames_per_clip, 1, 1)
             return (input)
@@ -473,6 +555,24 @@ def init_opt(
     final_lr=0.0,
     use_bfloat16=False
 ):
+    """
+    Initialize the optimizer, scheduler, and gradient scaler for the given classifier.
+
+    Parameters:
+        classifier: The classifier model to optimize.
+        iterations_per_epoch: The number of iterations in each epoch.
+        start_lr: The starting learning rate.
+        ref_lr: The reference learning rate.
+        warmup: The number of epochs to warmup the learning rate.
+        num_epochs: The total number of epochs.
+        wd: The weight decay to use for the first parameter group.
+        final_wd: The final weight decay to use for the first parameter group.
+        final_lr: The final learning rate to use.
+        use_bfloat16: Whether to use bfloat16 for the gradient scaler.
+
+    Returns:
+        A tuple containing the initialized optimizer, gradient scaler, scheduler, and weight decay scheduler.
+    """
     param_groups = [
         {
             'params': (p for n, p in classifier.named_parameters()

@@ -41,6 +41,29 @@ class VisionTransformer(nn.Module):
         uniform_power=False,
         **kwargs
     ):
+        """
+        Args:
+            img_size: The size of the input image.
+            patch_size: The size of each patch in the input image.
+            num_frames: The number of frames to use for the input video.
+            tubelet_size: The tubelet size used for the input video.
+            in_chans: The number of input channels.
+            embed_dim: The number of dimensions in the embedding space.
+            depth: The number of transformer encoder layers.
+            num_heads: The number of attention heads in each layer.
+            mlp_ratio: The ratio of the number of channels in the MLP
+                (hidden layer) to the embedding dimension.
+            qkv_bias: Whether to add a bias term to the query, key, and value
+                projection layers.
+            qk_scale: The scaling factor for the qk attention scores.
+            drop_rate: The dropout rate for the transformer encoder layers.
+            attn_drop_rate: The dropout rate for the attention weights.
+            norm_layer: The normalization layer to use.
+            init_std: The standard deviation of the truncation normal
+                initialization.
+            out_layers: The output layers of the model.
+            uniform_power: Whether to use uniform power normalization.
+        """
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -110,6 +133,21 @@ class VisionTransformer(nn.Module):
         self._rescale_blocks()
 
     def _init_pos_embed(self, pos_embed):
+        """
+        Initialize the positional embedding tensor with sine-cosine positional encodings.
+
+        Args:
+            pos_embed (torch.Tensor): The positional embedding tensor to be initialized.
+                The last dimension of `pos_embed` should match the embedding dimension.
+
+        The function computes either 2D or 3D sine-cosine positional encodings based on
+        whether the model is processing video input. For video inputs, the encoding is 3D
+        with dimensions determined by the grid size and depth. For image inputs, the 
+        encoding is 2D based only on the grid size.
+
+        The computed positional encodings are copied to the `pos_embed` tensor.
+        """
+
         embed_dim = pos_embed.size(-1)
         grid_size = self.input_size // self.patch_size
         if self.is_video:
@@ -126,6 +164,19 @@ class VisionTransformer(nn.Module):
         pos_embed.copy_(torch.from_numpy(sincos).float().unsqueeze(0))
 
     def _init_weights(self, m):
+        """
+        Initialize the weights of the given module.
+
+        Args:
+            m (nn.Module): The module whose weights and biases are to be initialized.
+
+        This function initializes the weights of linear, layer normalization, and
+        convolutional layers (both 2D and 3D) using a truncated normal distribution
+        with a standard deviation specified by `self.init_std`. It also sets the
+        biases of these layers to zero if present. For nn.LayerNorm, the weights
+        are initialized to 1.0 and biases to 0.
+        """
+
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=self.init_std)
             if isinstance(m, nn.Linear) and m.bias is not None:
@@ -143,6 +194,11 @@ class VisionTransformer(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def _rescale_blocks(self):
+        """
+        Rescale the weights of each layer in the VisionTransformer by a factor of
+        sqrt(2 * layer_id), following the recipe in the VisionTransformer paper.
+        This is used to prevent the weights from growing too large during training.
+        """
         def rescale(param, layer_id):
             param.div_(math.sqrt(2.0 * layer_id))
 
@@ -195,6 +251,28 @@ class VisionTransformer(nn.Module):
         return x
 
     def interpolate_pos_encoding(self, x, pos_embed):
+
+        """
+        Interpolate the positional encoding to match the input dimensions.
+
+        Args:
+            x (torch.Tensor): The input tensor, which is either a video or an image.
+                For video input, it should have shape (B, C, T, H, W).
+                For image input, it should have shape (B, C, H, W).
+            pos_embed (torch.Tensor): The positional embedding tensor to be interpolated.
+                It has shape (1, N, dim), where N is the number of patches and dim is the
+                embedding dimension.
+
+        Returns:
+            torch.Tensor: The interpolated positional embedding tensor with adjusted dimensions
+            to match the input size.
+
+        The function handles both video and image inputs, performing trilinear interpolation
+        for video positional encodings and bicubic interpolation for image positional encodings.
+        It first checks if the current positional embedding already matches the input dimensions.
+        If not, it computes the scale factor based on the input size and the initialized shape
+        of the positional embedding, and interpolates accordingly.
+        """
 
         _, N, dim = pos_embed.shape
 
