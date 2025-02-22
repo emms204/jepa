@@ -228,13 +228,26 @@ class VJEPADecoderTrainer:
         model_cfg = self.config['model']
         import src.models.decoder as video_vitd
 
-        decoder =  video_vitd.__dict__[model_cfg['model_name']](
-            img_size=self.config['data']['crop_size'],
-            patch_size=self.config['data']['patch_size'],
-            num_frames=self.config['data']['num_frames'],
-            tubelet_size=self.config['data']['tubelet_size'],
-        ).to(self.device)
-        return decoder
+        # Get predictor's output dimension
+        predictor_out_dim = self.predictor.backbone.predictor_proj.out_features
+
+        # Create kwargs with matching configuration
+        decoder_kwargs = {
+            'img_size': self.config['data']['crop_size'],
+            'patch_size': self.config['data']['patch_size'],
+            'num_frames': self.config['data']['num_frames'],
+            'tubelet_size': self.config['data']['tubelet_size'],
+            'in_chans': 3,
+            'embed_dim': predictor_out_dim,  # Input dimension matches predictor output
+            'decoder_embed_dim': self.config['model'].get('decoder_embed_dim', predictor_out_dim // 2),  # Usually smaller
+            'depth': self.config['model'].get('decoder_depth', 8),
+            'num_heads': self.config['model'].get('decoder_heads', 8),
+            'mlp_ratio': 4.0,
+            'uniform_power': False
+        }
+
+        decoder = video_vitd.__dict__[model_cfg['decoder_type']](**decoder_kwargs)
+        return decoder.to(self.device)
 
     def _load_checkpoint(self, checkpoint_path):
         """Load trained weights from checkpoint"""
@@ -292,20 +305,27 @@ class VJEPADecoderTrainer:
                         masks_tgt=masks_pred,
                         mask_index=0
                     )
-                
+                                
                 # Decode predictions to pixel space
-                decoded_frames = self.decoder(predicted_embeddings)
+                decoded_frames_list = self.decoder(predicted_embeddings)
+
+                loss = 0
+                for decoded_frame, mask_pred in zip(decoded_frames_list, masks_pred):
+                    # Reshape clips and decoded frames for loss computation
+                    clips_reshaped = clips.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B*T*H*W, C)
+                    decoded_reshaped = decoded_frame.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B*T*H*W, C)
+                    
+                    # Flatten mask_pred and ensure it is of type long
+                    mask_pred = mask_pred.flatten().long()
+                    
+                    # Get the target pixels using masks_pred
+                    target_pixels = torch.index_select(clips_reshaped, 0, mask_pred)
+                    predicted_pixels = torch.index_select(decoded_reshaped, 0, mask_pred)
+                    
+                    # Compute reconstruction loss only on masked regions
+                    loss += self.recon_loss(predicted_pixels, target_pixels)
                 
-                # Reshape clips and decoded frames for loss computation
-                clips_reshaped = clips.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B*T*H*W, C)
-                decoded_reshaped = decoded_frames.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B*T*H*W, C)
-                
-                # Get the target pixels using masks_pred
-                target_pixels = torch.index_select(clips_reshaped, 0, masks_pred[0])
-                predicted_pixels = torch.index_select(decoded_reshaped, 0, masks_pred[0])
-                
-                # Compute reconstruction loss only on masked regions
-                loss = self.recon_loss(predicted_pixels, target_pixels)
+                loss /= len(masks_pred)
                 
                 # Backprop
                 self.optimizer.zero_grad()
@@ -326,7 +346,7 @@ class VJEPADecoderTrainer:
                 # Visualize occasionally
                 if batch_idx % self.config['logging']['vis_interval'] == 0:
                     self._log_visualizations(
-                        clips, decoded_frames, masks_pred,
+                        clips, decoded_frames_list[0], masks_pred[0],
                         f'train_vis_epoch_{epoch}_batch_{batch_idx}'
                     )
         
@@ -358,24 +378,31 @@ class VJEPADecoderTrainer:
                 )
             
             # Decode predictions to pixel space
-            decoded_frames = self.decoder(predicted_embeddings)
+            decoded_frames_list = self.decoder(predicted_embeddings)
+
+            loss = 0
+            for decoded_frame, mask_pred in zip(decoded_frames_list, masks_pred):
+                # Reshape clips and decoded frames for loss computation
+                clips_reshaped = clips.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B*T*H*W, C)
+                decoded_reshaped = decoded_frame.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B*T*H*W, C)
+                
+                # Flatten mask_pred and ensure it is of type long
+                mask_pred = mask_pred.flatten().long()
+                
+                # Get the target pixels using masks_pred
+                target_pixels = torch.index_select(clips_reshaped, 0, mask_pred)
+                predicted_pixels = torch.index_select(decoded_reshaped, 0, mask_pred)
+                
+                # Compute reconstruction loss only on masked regions
+                loss += self.recon_loss(predicted_pixels, target_pixels)
             
-            # Reshape clips and decoded frames for loss computation
-            clips_reshaped = clips.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B*T*H*W, C)
-            decoded_reshaped = decoded_frames.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B*T*H*W, C)
-            
-            # Get the target pixels using masks_pred
-            target_pixels = torch.index_select(clips_reshaped, 0, masks_pred[0])
-            predicted_pixels = torch.index_select(decoded_reshaped, 0, masks_pred[0])
-            
-            # Compute reconstruction loss only on masked regions
-            loss = self.recon_loss(predicted_pixels, target_pixels)
+            loss /= len(masks_pred)
             total_loss += loss.item()
             
             # Visualize occasionally
             if batch_idx % self.config['logging']['vis_interval'] == 0:
                 self._log_visualizations(
-                    clips, decoded_frames, clips,
+                    clips, decoded_frames_list[0], masks_pred[0],
                     f'val_vis_epoch_{epoch}_batch_{batch_idx}'
                 )
         

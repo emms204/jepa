@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 
 from src.models.utils.patch_embed import PatchEmbed, PatchEmbed3D
 from src.models.utils.modules import Block
@@ -140,8 +141,92 @@ class VisionTransformerDecoder(nn.Module):
                 
         self.apply(_init_layer)
 
+    def interpolate_pos_encoding(self, x, pos_embed):
+        """
+        Interpolate positional encoding to match the token count of x
+        without assuming a strict grid.
+        """
+        B, N, D = x.shape
+        if N == pos_embed.shape[1]:
+            return pos_embed
+        # Do a simple 1D (sequence) interpolation
+        new_pos_embed = nn.functional.interpolate(pos_embed.transpose(1, 2), 
+                                                size=N, mode='linear', 
+                                                align_corners=False)
+        return new_pos_embed.transpose(1, 2)
+
+    # def interpolate_pos_encoding(self, x, pos_embed):
+    #     """Interpolate positional encoding to match input dimensions."""
+    #     B, N, D = x.shape
+    #     dim = pos_embed.shape[-1]
+        
+    #     # Get original grid size
+    #     H = W = self.img_size // self.patch_size
+    #     if self.num_frames > 1:
+    #         T = self.num_frames // self.tubelet_size
+    #         N_orig = T * H * W  # Original number of patches
+            
+    #         # If sizes match, no interpolation needed
+    #         if N == N_orig:
+    #             return pos_embed
+            
+    #         # Reshape and interpolate for video
+    #         pos_embed = pos_embed.reshape(1, T, H, W, dim)
+            
+    #         # Calculate new temporal and spatial dimensions
+    #         new_T = N // (H * W)  # Assume temporal dimension scales proportionally
+            
+    #         # Interpolate
+    #         pos_embed = torch.nn.functional.interpolate(
+    #             pos_embed.permute(0, 4, 1, 2, 3),
+    #             size=(new_T, H, W),
+    #             mode='trilinear'
+    #         )
+    #         pos_embed = pos_embed.permute(0, 2, 3, 4, 1).reshape(1, N, dim)
+            
+    #     else:
+    #         N_orig = H * W  # Original number of patches
+            
+    #         # If sizes match, no interpolation needed
+    #         if N == N_orig:
+    #             return pos_embed
+            
+    #         # Calculate new spatial dimensions
+    #         new_size = int(math.sqrt(N))
+            
+    #         # Reshape and interpolate for image
+    #         pos_embed = pos_embed.reshape(1, H, W, dim)
+    #         pos_embed = torch.nn.functional.interpolate(
+    #             pos_embed.permute(0, 3, 1, 2),
+    #             size=(new_size, new_size),
+    #             mode='bicubic'
+    #         )
+    #         pos_embed = pos_embed.permute(0, 2, 3, 1).reshape(1, N, dim)
+        
+    #     return pos_embed
+
     def forward(self, x, return_intermediates=False):
-        # x shape: (B, N, encoder_embed_dim)
+        """
+        Forward pass through decoder
+        Args:
+            x: Single tensor or list of tensors of shape (B, N, embed_dim)
+            return_intermediates: Whether to return intermediate activations
+        """
+        if isinstance(x, list):
+            # Process each embedding separately and return list of reconstructions
+            outputs = []
+            for embedding in x:
+                if return_intermediates:
+                    out, intermediates = self._forward_single(embedding, return_intermediates=True)
+                    outputs.append((out, intermediates))
+                else:
+                    outputs.append(self._forward_single(embedding))
+            return outputs
+        else:
+            # Process single embedding
+            return self._forward_single(x, return_intermediates)
+
+    def _forward_single(self, x, return_intermediates=False):
         """
         Perform a forward pass through the VisionTransformerDecoder.
 
@@ -159,14 +244,14 @@ class VisionTransformerDecoder(nn.Module):
                 If True, returns a tuple containing the output tensor and a list
                 of intermediate outputs from each transformer block.
         """
-
         B = x.shape[0]
         
         # Project to decoder embedding dimension
         x = self.embed_proj(x)
         
-        # Add positional embeddings
-        x = x + self.pos_embed
+        # Interpolate and add positional embeddings
+        pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
+        x = x + pos_embed
         
         # Store intermediates if requested
         intermediates = []
@@ -182,28 +267,23 @@ class VisionTransformerDecoder(nn.Module):
         # Project to patch dimension
         x = self.patch_proj(x)  # (B, N, patch_dim)
         
+        # If the number of tokens does not match the expected number of patches, interpolate along the sequence dimension
+        if x.shape[1] != self.num_patches:
+            x = nn.functional.interpolate(x.transpose(1, 2), size=self.num_patches, mode='linear', align_corners=False).transpose(1, 2)
+        
         # Reshape to video/image dimensions
         H = W = self.img_size // self.patch_size
         if self.num_frames > 1:
             # Video reshaping
             T = self.num_frames // self.tubelet_size
-            x = x.reshape(B, T, H, W, 
-                         self.tubelet_size, self.patch_size, self.patch_size, 
-                         self.in_chans)
+            x = x.reshape(B, T, H, W, self.tubelet_size, self.patch_size, self.patch_size, self.in_chans)
             x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
-            x = x.reshape(B, self.in_chans, 
-                         self.num_frames, 
-                         self.img_size, 
-                         self.img_size)
+            x = x.reshape(B, self.in_chans, self.num_frames, self.img_size, self.img_size)
         else:
             # Image reshaping
-            x = x.reshape(B, H, W, 
-                         self.patch_size, self.patch_size, 
-                         self.in_chans)
+            x = x.reshape(B, H, W, self.patch_size, self.patch_size, self.in_chans)
             x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
-            x = x.reshape(B, self.in_chans, 
-                         self.img_size, 
-                         self.img_size)
+            x = x.reshape(B, self.in_chans, self.img_size, self.img_size)
         
         # Apply final activation
         x = self.final_act(x)
@@ -214,11 +294,6 @@ class VisionTransformerDecoder(nn.Module):
 
 def vit_tiny(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
-        img_size=224,
-        patch_size=patch_size,
-        num_frames=1,
-        tubelet_size=2,
-        embed_dim=192,
         decoder_embed_dim=192,
         depth=12,
         num_heads=3,
@@ -229,11 +304,6 @@ def vit_tiny(patch_size=16, **kwargs):
 
 def vit_small(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
-        img_size=224,
-        patch_size=patch_size,
-        num_frames=1,
-        tubelet_size=2,
-        embed_dim=384,
         decoder_embed_dim=384,
         depth=12,
         num_heads=6,
@@ -244,11 +314,6 @@ def vit_small(patch_size=16, **kwargs):
 
 def vit_base(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
-        img_size=224,
-        patch_size=patch_size,
-        num_frames=1,
-        tubelet_size=2,
-        embed_dim=768,
         decoder_embed_dim=768,
         depth=12,
         num_heads=12,
@@ -259,11 +324,6 @@ def vit_base(patch_size=16, **kwargs):
 
 def vit_large(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
-        img_size=224,
-        patch_size=patch_size,
-        num_frames=1,
-        tubelet_size=2,
-        embed_dim=1024,
         decoder_embed_dim=1024,
         depth=24,
         num_heads=16,
@@ -274,11 +334,6 @@ def vit_large(patch_size=16, **kwargs):
 
 def vit_huge(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
-        img_size=224,
-        patch_size=patch_size,
-        num_frames=1,
-        tubelet_size=2,
-        embed_dim=1280,
         decoder_embed_dim=1280,
         depth=32,
         num_heads=16,
