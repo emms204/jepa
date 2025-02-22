@@ -212,7 +212,7 @@ class VisionTransformerDecoder(nn.Module):
             return x, intermediates
         return x
 
-def vit_decoder_tiny(patch_size=16, **kwargs):
+def vit_tiny(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
         img_size=224,
         patch_size=patch_size,
@@ -224,9 +224,10 @@ def vit_decoder_tiny(patch_size=16, **kwargs):
         num_heads=3,
         mlp_ratio=4.0,
         uniform_power=False,
+        **kwargs
     )       
 
-def vit_decoder_small(patch_size=16, **kwargs):
+def vit_small(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
         img_size=224,
         patch_size=patch_size,
@@ -238,9 +239,10 @@ def vit_decoder_small(patch_size=16, **kwargs):
         num_heads=6,
         mlp_ratio=4.0,
         uniform_power=False,
+        **kwargs
     )
 
-def vit_decoder_base(patch_size=16, **kwargs):
+def vit_base(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
         img_size=224,
         patch_size=patch_size,
@@ -252,9 +254,10 @@ def vit_decoder_base(patch_size=16, **kwargs):
         num_heads=12,
         mlp_ratio=4.0,
         uniform_power=False,
+        **kwargs
     )
 
-def vit_decoder_large(patch_size=16, **kwargs):
+def vit_large(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
         img_size=224,
         patch_size=patch_size,
@@ -266,9 +269,10 @@ def vit_decoder_large(patch_size=16, **kwargs):
         num_heads=16,
         mlp_ratio=4.0,
         uniform_power=False,
+        **kwargs
     )
 
-def vit_decoder_huge(patch_size=16, **kwargs):
+def vit_huge(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
         img_size=224,
         patch_size=patch_size,
@@ -280,4 +284,5 @@ def vit_decoder_huge(patch_size=16, **kwargs):
         num_heads=16,
         mlp_ratio=4.0, 
         uniform_power=False,
+        **kwargs
     )

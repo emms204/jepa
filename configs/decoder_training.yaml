@@ -1,19 +1,95 @@
-model:
-  # Decoder specific configs inherited from main config
-
 training:
-  lr: 1e-4
+  lr: 0.0001
   weight_decay: 0.05
-  num_epochs: 100
-  batch_size: 32
-
-mask:
-  # Masking strategy configs inherited from main config
+  num_epochs: 10
+  num_workers: 4
 
 logging:
   use_wandb: true
-  project_name: "vjepa_decoder"
+  project_name: "jepa-decoder"
   vis_interval: 100  # Log visualizations every N batches
 
-checkpoints:
-  path: "checkpoints/decoder" 
+
+dataset:
+  train_csv_path: "path/to/train.csv"
+  val_csv_path: "path/to/val.csv"
+  dataset_type: "videodataset"
+  decode_one_clip: true
+  batch_size: 24
+  num_clips: 1
+  num_frames: 16
+  tubelet_size: 2
+  sampling_rate: 4
+  crop_size: 224
+  patch_size: 16
+  pin_mem: true
+  num_workers: 4
+  filter_short_videos: false
+  clip_duration: null
+
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0. 
+
+mask:
+  - aspect_ratio:
+      - 0.75
+      - 1.5
+    num_blocks: 8
+    spatial_scale:
+      - 0.15
+      - 0.15
+    temporal_scale:
+      - 1.0
+      - 1.0
+    max_temporal_keep: 1.0
+    max_keep: null
+  - aspect_ratio:
+      - 0.75
+      - 1.5
+    num_blocks: 2
+    spatial_scale:
+      - 0.7
+      - 0.7
+    temporal_scale:
+      - 1.0
+      - 1.0
+    max_temporal_keep: 1.0
+    max_keep: null
+
+meta:
+  load_checkpoint: true
+  folder: /your_absolute_file_path_to_directory_where_pretrained_models_are_contained/
+  checkpoint: jepa-latest.pth.tar  # name of pretrained model file inside folder
+  use_sdpa: true
+  dtype: bfloat16
+
+model:
+  model_name: vit_large
+  pred_depth: 12
+  pred_embed_dim: 384
+  uniform_power: true
+  use_mask_tokens: true
+  zero_init_mask_tokens: true
+  
+optimization:
+  ipe: 300
+  ipe_scale: 1.25
+  clip_grad: 10.0
+  weight_decay: 0.04
+  final_weight_decay: 0.4
+  epochs: 300
+  warmup: 40
+  start_lr: 0.0002
+  lr: 0.000625
+  final_lr: 1.0e-06
+  ema:
+  - 0.998
+  - 1.0
