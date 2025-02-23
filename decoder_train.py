@@ -2,12 +2,14 @@ import torch
 import os
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
 import wandb
 import numpy as np
 from tqdm import tqdm
 import yaml
+import logging
 
 from app.vjepa.utils import (
     init_video_model,
@@ -26,7 +28,6 @@ np.random.seed(_GLOBAL_SEED)
 torch.manual_seed(_GLOBAL_SEED)
 torch.backends.cudnn.benchmark = True
 
-
 logger = get_logger(__name__)
 
 class VJEPADecoderTrainer:
@@ -35,6 +36,8 @@ class VJEPADecoderTrainer:
         config,
         device='cuda'
     ):
+        logger.info("Initializing VJEPADecoderTrainer")
+        logger.info(f"Using device: {device}")
         
         # Setup device
         self.config = config
@@ -46,6 +49,10 @@ class VJEPADecoderTrainer:
         ckp_fname = cfgs_meta.get('checkpoint', None)
         use_sdpa = cfgs_meta.get('use_sdpa', False)
         which_dtype = cfgs_meta.get('dtype')
+        
+        logger.info(f"Loading checkpoint from: {os.path.join(pretrain_folder, ckp_fname)}")
+        logger.info(f"Using SDPA: {use_sdpa}, dtype: {which_dtype}")
+        
         if which_dtype.lower() == 'bfloat16':
             dtype = torch.bfloat16
             mixed_precision = True
@@ -55,6 +62,10 @@ class VJEPADecoderTrainer:
         else:
             dtype = torch.float32
             mixed_precision = False
+        
+        self.dtype = dtype
+        self.mixed_precision = mixed_precision
+        logger.info(f"Using dtype: {dtype}, mixed precision: {mixed_precision}")
 
         pretrained_path = os.path.join(pretrain_folder, ckp_fname)
 
@@ -99,6 +110,29 @@ class VJEPADecoderTrainer:
         reprob = cfgs_data_aug.get('reprob', 0.)
         use_aa = cfgs_data_aug.get('auto_augment', False)
 
+        # -- LOSS
+        cfgs_loss = self.config.get('loss')
+        self.loss_exp = cfgs_loss.get('loss_exp')
+        self.reg_coeff = cfgs_loss.get('reg_coeff')
+
+        # -- OPTIMIZATION
+        cfgs_opt = self.config.get('optimization')
+        ipe = cfgs_opt.get('ipe', None)
+        ipe_scale = cfgs_opt.get('ipe_scale', 1.0)
+        clip_grad = cfgs_opt.get('clip_grad', None)
+        wd = float(cfgs_opt.get('weight_decay'))
+        final_wd = float(cfgs_opt.get('final_weight_decay'))
+        num_epochs = cfgs_opt.get('epochs')
+        warmup = cfgs_opt.get('warmup')
+        start_lr = cfgs_opt.get('start_lr')
+        lr = cfgs_opt.get('lr')
+        final_lr = cfgs_opt.get('final_lr')
+        ema = cfgs_opt.get('ema')
+        betas = cfgs_opt.get('betas', (0.9, 0.999))
+        eps = cfgs_opt.get('eps', 1.e-8)
+
+        # Initialize models
+        logger.info("Initializing encoder and predictor models")
         encoder, predictor = init_video_model(
             uniform_power=uniform_power,
             use_mask_tokens=use_mask_tokens,
@@ -118,12 +152,15 @@ class VJEPADecoderTrainer:
         # Models
         self.encoder = encoder.to(device)
         self.predictor = predictor.to(device)
-
+        
+        logger.info("Loading pretrained weights")
         self._load_checkpoint(pretrained_path)
-
+        
+        logger.info("Initializing decoder")
         self.decoder = self._init_decoder()
         
         # Freeze encoder and predictor
+        logger.info("Freezing encoder and predictor parameters")
         for model in [self.encoder, self.predictor]:
             for param in model.parameters():
                 param.requires_grad = False
@@ -155,8 +192,6 @@ class VJEPADecoderTrainer:
             motion_shift=motion_shift,
             crop_size=crop_size)
 
-
-        
         # Initialize datasets and dataloaders
         train_dataset, train_loader = init_data(
             data='videodataset',
@@ -180,7 +215,6 @@ class VJEPADecoderTrainer:
         )
         self.train_loader = train_loader
 
-
         val_dataset, val_loader = init_data(
             data='videodataset',
             root_path=val_path,
@@ -203,21 +237,21 @@ class VJEPADecoderTrainer:
         )
         self.val_loader = val_loader
         
-        
-        
-        
-        # Optimizer
+        # Initialize optimizer and loss
+        logger.info("Initializing optimizer and loss functions")
         self.optimizer = optim.AdamW(
             self.decoder.parameters(),
             lr=self.config['training']['lr'],
-            weight_decay=self.config['training']['weight_decay']
+            weight_decay=self.config['training']['weight_decay'],
+            betas=betas,
+            eps=eps
         )
-        
-        # Loss functions
+        self.scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
         self.recon_loss = nn.L1Loss()
         
         # Initialize wandb
         if config['logging']['use_wandb']:
+            logger.info("Initializing wandb")
             wandb.init(
                 project=config['logging']['project_name'],
                 config=config
@@ -239,11 +273,9 @@ class VJEPADecoderTrainer:
             'tubelet_size': self.config['data']['tubelet_size'],
             'in_chans': 3,
             'embed_dim': predictor_out_dim,  # Input dimension matches predictor output
-            'decoder_embed_dim': self.config['model'].get('decoder_embed_dim', predictor_out_dim // 2),  # Usually smaller
-            'depth': self.config['model'].get('decoder_depth', 8),
-            'num_heads': self.config['model'].get('decoder_heads', 8),
-            'mlp_ratio': 4.0,
-            'uniform_power': False
+            'decoder_embed_dim': self.config['model'].get('decoder_embed_dim', predictor_out_dim),  # Usually smaller
+            'depth': self.config['model'].get('decoder_depth', 12),
+            'num_heads': self.config['model'].get('decoder_heads', 12),
         }
 
         decoder = video_vitd.__dict__[model_cfg['decoder_type']](**decoder_kwargs)
@@ -252,52 +284,85 @@ class VJEPADecoderTrainer:
     def _load_checkpoint(self, checkpoint_path):
         """Load trained weights from checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        msg = self.encoder.load_state_dict(checkpoint['encoder'])
-        logger.info(f'loaded pretrained encoder with msg: {msg}')
-        msg = self.predictor.load_state_dict(checkpoint['predictor'])
-        logger.info(f'loaded pretrained predictor with msg: {msg}')
+        pretrained_dict = checkpoint['encoder']
+        
+        pretrained_dict = {k.replace('module.', ''): v for k, v in pretrained_dict.items()}
+        pretrained_dict = {k.replace('backbone.', ''): v for k, v in pretrained_dict.items()}
+        for k, v in self.encoder.state_dict().items():
+            if k not in pretrained_dict:
+                logger.info(f'key "{k}" could not be found in loaded state dict')
+            elif pretrained_dict[k].shape != v.shape:
+                logger.info(f'key "{k}" is of different shape in model and loaded state dict')
+                pretrained_dict[k] = v
+        msg = self.encoder.load_state_dict(pretrained_dict, strict=False)
+        print(self.encoder)
+        # logger.info(f'loaded pretrained model with msg: {msg}')
+        logger.info(f'loaded pretrained encoder from epoch: {checkpoint["epoch"]}\n path: {checkpoint_path}')
+        
+        pretrained_dict = checkpoint['predictor']
+        pretrained_dict = {k.replace('module.', ''): v for k, v in pretrained_dict.items()}
+        pretrained_dict = {k.replace('backbone.', ''): v for k, v in pretrained_dict.items()}
+        for k, v in self.predictor.state_dict().items():
+            if k not in pretrained_dict:
+                logger.info(f'key "{k}" could not be found in loaded state dict')
+            elif pretrained_dict[k].shape != v.shape:
+                logger.info(f'key "{k}" is of different shape in model and loaded state dict')
+                pretrained_dict[k] = v
+        msg = self.predictor.load_state_dict(pretrained_dict, strict=False)
+        print(self.predictor)
+        # logger.info(f'loaded pretrained model with msg: {msg}')
+        logger.info(f'loaded pretrained predictor from epoch: {checkpoint["epoch"]}\n path: {checkpoint_path}')
+        
         # self.target_encoder.load_state_dict(checkpoint['target_encoder'])
         # self.decoder.load_state_dict(checkpoint['decoder'])
     
     def load_clips(self, video, masks_enc, masks_pred):
-        # -- unsupervised video clips
-        # Put each clip on the GPU and concatenate along batch
-        # dimension
+        logger.debug("Loading clips and masks to device")
+        logger.debug(f"Input video shape: {[v.shape for v in video[0]]}")
+        
         clips = torch.cat([u.to(self.device, non_blocking=True) for u in video[0]], dim=0)
-
-        # Put each mask-enc/mask-pred pair on the GPU and reuse the
-        # same mask pair for each clip
+        logger.debug(f"Concatenated clips shape: {clips.shape}")
+        
         _masks_enc, _masks_pred = [], []
         batch_size = self.config['data']['batch_size']
         num_clips = self.config['data']['num_clips']
-        for _me, _mp in zip(masks_enc, masks_pred):
+        
+        for i, (_me, _mp) in enumerate(zip(masks_enc, masks_pred)):
             _me = _me.to(self.device, non_blocking=True)
             _mp = _mp.to(self.device, non_blocking=True)
+            logger.debug(f"Mask pair {i+1} shapes - Encoder: {_me.shape}, Predictor: {_mp.shape}")
+            
             _me = repeat_interleave_batch(_me, batch_size, repeat=num_clips)
             _mp = repeat_interleave_batch(_mp, batch_size, repeat=num_clips)
+            logger.debug(f"After repeat - Encoder: {_me.shape}, Predictor: {_mp.shape}")
+            
             _masks_enc.append(_me)
             _masks_pred.append(_mp)
-
-        return (clips, _masks_enc, _masks_pred)
+        
+        return clips, _masks_enc, _masks_pred
     
     def train_epoch(self, epoch):
         self.decoder.train()
         total_loss = 0
         num_batches = len(self.train_loader)
         
+        logger.info(f"Starting training epoch {epoch}")
+        
         with tqdm(self.train_loader, desc=f'Epoch {epoch}') as pbar:
             for batch_idx, (video, masks_enc, masks_pred) in enumerate(pbar):
-                assert len(masks_enc) == len(masks_pred), 'Currently require num encoder masks = num predictor masks'
-
+                logger.debug(f"Processing batch {batch_idx+1}/{num_batches}")
+                
                 clips, masks_enc, masks_pred = self.load_clips(video, masks_enc, masks_pred)
                 B, C, T, H, W = clips.shape
+                logger.debug(f"Processed clips shape: {clips.shape}")
                 
                 # Get embeddings from encoder
                 with torch.no_grad():
-                    # Get context embeddings using encoder mask
+                    logger.debug("Computing encoder embeddings")
                     context_embeddings = self.encoder(clips, masks_enc)
+                    logger.debug(f"Context embeddings shape: {context_embeddings.shape}")
                     
-                    # Get predictions from predictor using both masks
+                    logger.debug("Computing predictor embeddings")
                     predicted_embeddings = self.predictor(
                         ctxt=context_embeddings,
                         tgt=None,
@@ -305,32 +370,66 @@ class VJEPADecoderTrainer:
                         masks_tgt=masks_pred,
                         mask_index=0
                     )
-                                
-                # Decode predictions to pixel space
-                decoded_frames_list = self.decoder(predicted_embeddings)
-
-                loss = 0
-                for decoded_frame, mask_pred in zip(decoded_frames_list, masks_pred):
-                    # Reshape clips and decoded frames for loss computation
-                    clips_reshaped = clips.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B*T*H*W, C)
-                    decoded_reshaped = decoded_frame.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B*T*H*W, C)
-                    
-                    # Flatten mask_pred and ensure it is of type long
-                    mask_pred = mask_pred.flatten().long()
-                    
-                    # Get the target pixels using masks_pred
-                    target_pixels = torch.index_select(clips_reshaped, 0, mask_pred)
-                    predicted_pixels = torch.index_select(decoded_reshaped, 0, mask_pred)
-                    
-                    # Compute reconstruction loss only on masked regions
-                    loss += self.recon_loss(predicted_pixels, target_pixels)
+                    logger.debug(f"Predicted embeddings shape: {predicted_embeddings.shape}")
                 
-                loss /= len(masks_pred)
+                # Decode predictions
+                with torch.cuda.amp.autocast(dtype=self.dtype, enabled=self.mixed_precision):
+                    logger.debug("Decoding predictions")
+                    decoded_frames_list = self.decoder(
+                        ctxts=context_embeddings,
+                        tgts=predicted_embeddings,
+                        masks_ctxts=masks_enc,
+                        masks_tgts=masks_pred
+                    )
+                    logger.debug(f"Decoded frames shapes: {[df.shape for df in decoded_frames_list]}")
+                    
+                    loss_jepa = 0
+                    loss_reg = 0
+                    
+                    for i, (decoded_frame, mask_pred) in enumerate(zip(decoded_frames_list, masks_pred)):
+                        mask_indices = mask_pred.flatten().nonzero().squeeze()
+                        logger.debug(f"Mask {i+1} - Number of masked indices: {len(mask_indices)}")
+                        
+                        target_pixels = clips.permute(0, 2, 3, 4, 1).reshape(-1, C)[mask_indices]
+                        pred_pixels = decoded_frame.permute(0, 2, 3, 4, 1).reshape(-1, C)[mask_indices]
+                        logger.debug(f"Target/Pred pixels shape: {target_pixels.shape}")
+                        
+                        # Compute losses
+                        curr_loss_jepa = torch.mean(torch.abs(pred_pixels - target_pixels)**self.loss_exp) / self.loss_exp
+                        pstd = torch.sqrt(torch.var(pred_pixels, dim=1) + 1e-6)
+                        curr_loss_reg = torch.mean(F.relu(1. - pstd))
+                        
+                        loss_jepa += curr_loss_jepa
+                        loss_reg += curr_loss_reg
+                        
+                        logger.debug(f"Mask {i+1} - JEPA loss: {curr_loss_jepa:.4f}, Reg loss: {curr_loss_reg:.4f}")
+                    
+                    loss_jepa /= len(masks_pred)
+                    loss = loss_jepa + self.reg_coeff * loss_reg
+                    
+                    logger.debug(f"Final losses - JEPA: {loss_jepa:.4f}, Reg: {loss_reg:.4f}, Total: {loss:.4f}")
                 
                 # Backprop
+                if self.mixed_precision:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                else:
+                    loss.backward()
+                
+                if self.config['optimization']['clip_grad'] is not None:
+                    _dec_norm = torch.nn.utils.clip_grad_norm_(
+                        self.decoder.parameters(), 
+                        self.config['optimization']['clip_grad']
+                    )
+                    logger.debug(f"Gradient norm after clipping: {_dec_norm}")
+                
+                if self.mixed_precision:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                
                 self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
                 
                 # Update metrics
                 total_loss += loss.item()
@@ -340,17 +439,25 @@ class VJEPADecoderTrainer:
                 if self.config['logging']['use_wandb']:
                     wandb.log({
                         'train_loss': loss.item(),
-                        'train_batch': batch_idx + epoch * num_batches
+                        'train_loss_jepa': loss_jepa.item(),
+                        'train_loss_reg': loss_reg.item(),
+                        'train_batch': batch_idx + epoch * num_batches,
+                        'grad_norm': _dec_norm if self.config['optimization']['clip_grad'] is not None else None
                     })
                 
                 # Visualize occasionally
                 if batch_idx % self.config['logging']['vis_interval'] == 0:
+                    logger.info(f"Creating visualizations for batch {batch_idx}")
                     self._log_visualizations(
-                        clips, decoded_frames_list[0], masks_pred[0],
+                        clips,
+                        decoded_frames_list,
+                        masks_pred,
                         f'train_vis_epoch_{epoch}_batch_{batch_idx}'
                     )
         
-        return total_loss / num_batches
+        avg_loss = total_loss / num_batches
+        logger.info(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
+        return avg_loss
     
     @torch.no_grad()
     def validate(self, epoch):
@@ -358,17 +465,17 @@ class VJEPADecoderTrainer:
         total_loss = 0
         num_batches = len(self.val_loader)
         
-        for batch_idx, (video, masks_enc, masks_pred) in enumerate(self.val_loader):
-            # Move data to device
-            clips, masks_enc, masks_pred = self.load_clips(video, masks_enc, masks_pred)
-            B, C, T, H, W = clips.shape
-            
-            # Get embeddings from encoder
-            with torch.no_grad():
-                # Get context embeddings using encoder mask
-                context_embeddings = self.encoder(clips, masks_enc)
+        logger.info(f"Starting validation epoch {epoch}")
+        
+        with tqdm(self.val_loader, desc=f'Validation Epoch {epoch}') as pbar:
+            for batch_idx, (video, masks_enc, masks_pred) in enumerate(pbar):
+                logger.debug(f"Processing validation batch {batch_idx+1}/{num_batches}")
                 
-                # Get predictions from predictor using both masks
+                clips, masks_enc, masks_pred = self.load_clips(video, masks_enc, masks_pred)
+                B, C, T, H, W = clips.shape
+                
+                # Get embeddings
+                context_embeddings = self.encoder(clips, masks_enc)
                 predicted_embeddings = self.predictor(
                     ctxt=context_embeddings,
                     tgt=None,
@@ -376,37 +483,48 @@ class VJEPADecoderTrainer:
                     masks_tgt=masks_pred,
                     mask_index=0
                 )
-            
-            # Decode predictions to pixel space
-            decoded_frames_list = self.decoder(predicted_embeddings)
-
-            loss = 0
-            for decoded_frame, mask_pred in zip(decoded_frames_list, masks_pred):
-                # Reshape clips and decoded frames for loss computation
-                clips_reshaped = clips.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B*T*H*W, C)
-                decoded_reshaped = decoded_frame.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B*T*H*W, C)
                 
-                # Flatten mask_pred and ensure it is of type long
-                mask_pred = mask_pred.flatten().long()
+                # Decode predictions
+                with torch.cuda.amp.autocast(dtype=self.dtype, enabled=self.mixed_precision):
+                    decoded_frames_list = self.decoder(
+                        ctxts=context_embeddings,
+                        tgts=predicted_embeddings,
+                        masks_ctxts=masks_enc,
+                        masks_tgts=masks_pred
+                    )
+                    
+                    loss_jepa = 0
+                    loss_reg = 0
+                    
+                    for decoded_frame, mask_pred in zip(decoded_frames_list, masks_pred):
+                        mask_indices = mask_pred.flatten().nonzero().squeeze()
+                        target_pixels = clips.permute(0, 2, 3, 4, 1).reshape(-1, C)[mask_indices]
+                        pred_pixels = decoded_frame.permute(0, 2, 3, 4, 1).reshape(-1, C)[mask_indices]
+                        
+                        loss_jepa += torch.mean(torch.abs(pred_pixels - target_pixels)**self.loss_exp) / self.loss_exp
+                        pstd = torch.sqrt(torch.var(pred_pixels, dim=1) + 1e-6)
+                        loss_reg += torch.mean(F.relu(1. - pstd))
+                    
+                    loss_jepa /= len(masks_pred)
+                    loss = loss_jepa + self.reg_coeff * loss_reg
+                    
+                    logger.debug(f"Validation batch {batch_idx} - Loss: {loss:.4f}")
                 
-                # Get the target pixels using masks_pred
-                target_pixels = torch.index_select(clips_reshaped, 0, mask_pred)
-                predicted_pixels = torch.index_select(decoded_reshaped, 0, mask_pred)
+                total_loss += loss.item()
                 
-                # Compute reconstruction loss only on masked regions
-                loss += self.recon_loss(predicted_pixels, target_pixels)
-            
-            loss /= len(masks_pred)
-            total_loss += loss.item()
-            
-            # Visualize occasionally
-            if batch_idx % self.config['logging']['vis_interval'] == 0:
-                self._log_visualizations(
-                    clips, decoded_frames_list[0], masks_pred[0],
-                    f'val_vis_epoch_{epoch}_batch_{batch_idx}'
-                )
+                # Visualize occasionally
+                if batch_idx % self.config['logging']['vis_interval'] == 0:
+                    logger.info(f"Creating validation visualizations for batch {batch_idx}")
+                    self._log_visualizations(
+                        clips,
+                        decoded_frames_list,
+                        masks_pred,
+                        f'val_vis_epoch_{epoch}_batch_{batch_idx}'
+                    )
         
         val_loss = total_loss / num_batches
+        logger.info(f"Validation epoch {epoch} completed. Average loss: {val_loss:.4f}")
+        
         if self.config['logging']['use_wandb']:
             wandb.log({
                 'val_loss': val_loss,
@@ -415,13 +533,13 @@ class VJEPADecoderTrainer:
         
         return val_loss
     
-    def _log_visualizations(self, video, predictions, masks_pred, name):
-        """Create and log visualization grids showing masked input, predictions, and ground truth
+    def _log_visualizations(self, video, decoded_frames_list, masks_pred_list, name):
+        """Create and log visualization grids showing context, predictions, and ground truth for multiple masks
     
         Args:
             video: Original video tensor (B,C,T,H,W)
-            predictions: Predicted frames tensor (B,C,T,H,W) 
-            masks_pred: Predictor masks indicating masked regions
+            decoded_frames_list: List of predicted frames tensors for each mask
+            masks_pred_list: List of predictor masks indicating masked regions
             name: Name for logging
         """
         if not self.config['logging']['use_wandb']:
@@ -429,59 +547,87 @@ class VJEPADecoderTrainer:
             
         # Convert to numpy and move channels last
         def prep_for_vis(tensor):
-            return tensor.cpu().numpy().transpose(0, 2, 3, 4, 1)  # (B,T,H,W,C)
+            return tensor.cpu().detach().numpy().transpose(0, 2, 3, 4, 1)  # (B,T,H,W,C)
         
-        # Prepare tensors
+        # Select random subset of masks to visualize (2-3 masks)
+        num_masks = min(3, len(masks_pred_list))
+        mask_indices = torch.randperm(len(masks_pred_list))[:num_masks]
+        
         video_np = prep_for_vis(video)
-        pred_np = prep_for_vis(predictions)
         
-        # Create masked version by zeroing out masked regions
-        masked_video = video.clone()
-        B, C, T, H, W = video.shape
-        flat_size = T * H * W
-        
-        # Create binary mask of same shape as video
-        binary_mask = torch.ones((B, 1, flat_size), device=video.device)
-        binary_mask.scatter_(2, masks_pred[0].unsqueeze(0).unsqueeze(0), 0)
-        binary_mask = binary_mask.view(B, 1, T, H, W)
-        binary_mask = binary_mask.expand(-1, C, -1, -1, -1)
-        
-        # Apply mask
-        masked_video = masked_video * binary_mask
-        masked_np = prep_for_vis(masked_video)
-        
-        # Take first item from batch and first frame
-        # Stack horizontally: [masked input | prediction | ground truth]
-        grid = np.concatenate([
-            masked_np[0, 0],  # First frame of masked input
-            pred_np[0, 0],    # First frame of prediction
-            video_np[0, 0]    # First frame of ground truth
-        ], axis=1)
-        
-        # Log to wandb
-        wandb.log({
-            name: wandb.Image(grid, caption="Masked Input | Prediction | Ground Truth")
-        })
+        for idx, mask_idx in enumerate(mask_indices):
+            mask_pred = masks_pred_list[mask_idx]
+            decoded_frame = decoded_frames_list[mask_idx]
+            pred_np = prep_for_vis(decoded_frame)
+            
+            # Create context version (original video with masked regions zeroed)
+            context_video = video.clone()
+            B, C, T, H, W = video.shape
+            flat_size = T * H * W
+            
+            # Create binary mask of same shape as video
+            binary_mask = torch.ones((B, 1, flat_size), device=video.device)
+            binary_mask.scatter_(2, mask_pred.unsqueeze(0).unsqueeze(0), 0)
+            binary_mask = binary_mask.view(B, 1, T, H, W)
+            binary_mask = binary_mask.expand(-1, C, -1, -1, -1)
+            
+            # Apply mask to get context
+            context_video = context_video * binary_mask
+            context_np = prep_for_vis(context_video)
+            
+            # Take first item from batch and first frame
+            # Stack horizontally: [context | prediction | ground truth]
+            grid = np.concatenate([
+                context_np[0, 0],    # First frame of context (masked input)
+                pred_np[0, 0],       # First frame of prediction
+                video_np[0, 0]       # First frame of ground truth
+            ], axis=1)
+            
+            # Log to wandb with mask index
+            wandb.log({
+                f"{name}_mask_{idx}": wandb.Image(
+                    grid, 
+                    caption=f"Mask {idx}: Context | Prediction | Ground Truth"
+                )
+            })
+            
+            # Optionally log temporal visualization (e.g., first 4 frames)
+            if T > 1:
+                temporal_grid = np.concatenate([
+                    np.concatenate([context_np[0, t] for t in range(min(4, T))], axis=1),
+                    np.concatenate([pred_np[0, t] for t in range(min(4, T))], axis=1),
+                    np.concatenate([video_np[0, t] for t in range(min(4, T))], axis=1)
+                ], axis=0)
+                
+                wandb.log({
+                    f"{name}_temporal_mask_{idx}": wandb.Image(
+                        temporal_grid,
+                        caption=f"Mask {idx} Temporal: Context | Prediction | Ground Truth"
+                    )
+                })
     
     def train(self, num_epochs):
-        """Full training loop"""
+        logger.info(f"Starting training for {num_epochs} epochs")
         best_val_loss = float('inf')
         
         for epoch in range(num_epochs):
             train_loss = self.train_epoch(epoch)
             val_loss = self.validate(epoch)
             
-            print(f'Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}')
+            logger.info(f'Epoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}')
             
             # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                save_path = f'{self.config["checkpoints"]["path"]}/best_decoder.pth'
+                logger.info(f"New best validation loss: {val_loss:.4f}. Saving model to {save_path}")
+                
                 torch.save({
                     'epoch': epoch,
                     'decoder_state_dict': self.decoder.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'val_loss': val_loss,
-                }, f'{self.config["checkpoints"]["path"]}/best_decoder.pth')
+                }, save_path)
 
 
 if __name__ == "__main__":

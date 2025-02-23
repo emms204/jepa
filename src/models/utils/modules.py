@@ -19,6 +19,16 @@ class MLP(nn.Module):
         act_layer=nn.GELU,
         drop=0.
     ):
+        """
+        Args:
+            in_features: The number of input features
+            hidden_features: The number of features in the hidden layer.
+                Defaults to `in_features` if not specified.
+            out_features: The number of output features. Defaults to `in_features`
+                if not specified.
+            act_layer: The activation layer to use. Defaults to nn.GELU.
+            drop: Dropout rate. Defaults to 0.
+        """
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -28,6 +38,16 @@ class MLP(nn.Module):
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
+        """
+        Forward pass of the MLP.
+
+        Args:
+            x: Input tensor of shape (batch_size, in_features).
+
+        Returns:
+            Output tensor of shape (batch_size, out_features).
+        """
+
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
@@ -47,6 +67,19 @@ class Attention(nn.Module):
         proj_drop=0.,
         use_sdpa=True
     ):
+        """
+        Initializes the Attention module.
+
+        Args:
+            dim (int): The input dimension of the attention layer.
+            num_heads (int, optional): The number of attention heads. Default is 8.
+            qkv_bias (bool, optional): If True, add a learnable bias to the query, key, value projections. Default is False.
+            qk_scale (float, optional): Scale factor for query and key. If None, use 1/sqrt(head_dim). Default is None.
+            attn_drop (float, optional): Dropout rate for the attention scores. Default is 0.
+            proj_drop (float, optional): Dropout rate for the output projection. Default is 0.
+            use_sdpa (bool, optional): If True, use scaled dot-product attention. Default is True.
+        """
+
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -59,6 +92,20 @@ class Attention(nn.Module):
         self.use_sdpa = use_sdpa
 
     def forward(self, x, mask=None):
+        """
+        Performs a forward pass through the attention layer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, N, C) where B is the batch size,
+                N is the sequence length, and C is the feature dimension.
+            mask (torch.Tensor, optional): Optional mask tensor for attention. Default is None.
+
+        Returns:
+            torch.Tensor: Output tensor after applying attention and projection, of shape (B, N, C).
+            torch.Tensor or None: The attention weights if not using scaled dot-product attention,
+                otherwise None.
+        """
+
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, D]
@@ -93,6 +140,22 @@ class Block(nn.Module):
         grid_size=None,
         grid_depth=None,
     ):
+        """
+        Initialize a Block module.
+
+        Args:
+            dim (int): The number of input and output channels.
+            num_heads (int): The number of attention heads.
+            mlp_ratio (float, optional): The ratio of the number of channels in the MLP layer to the number of channels in the input. Default is 4.0.
+            qkv_bias (bool, optional): If True, use bias terms in the query, key, and value projection layers. Default is False.
+            qk_scale (float, optional): The scaling factor for the query and key projection layers. If None, do not scale. Default is None.
+            drop (float, optional): The dropout probability for the attention and MLP layers. Default is 0.0.
+            attn_drop (float, optional): The dropout probability for the attention weights. Default is 0.0.
+            act_layer (nn.Module, optional): The activation function for the MLP layer. Default is nn.GELU.
+            norm_layer (nn.Module, optional): The normalization layer for the input and output. Default is nn.LayerNorm.
+            grid_size (int, optional): The size of the spatial grid. If None, do not use grid position embeddings. Default is None.
+            grid_depth (int, optional): The depth of the spatial grid. If None, do not use grid position embeddings. Default is None.
+        """
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
@@ -112,6 +175,20 @@ class Block(nn.Module):
             drop=drop)
 
     def forward(self, x, return_attention=False, mask=None):
+        """
+        Forward pass through the Block module.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, N, C), where B is the batch size, 
+                N is the sequence length, and C is the feature dimension.
+            return_attention (bool, optional): If True, returns the attention weights. Default is False.
+            mask (torch.Tensor, optional): Optional mask tensor for attention. Default is None.
+
+        Returns:
+            torch.Tensor: Output tensor after applying attention and MLP, of shape (B, N, C).
+            torch.Tensor or None: The attention weights if `return_attention` is True, otherwise None.
+        """
+
         y, attn = self.attn(self.norm1(x), mask=mask)
         if return_attention:
             return attn
@@ -128,6 +205,16 @@ class CrossAttention(nn.Module):
         qkv_bias=False,
         use_sdpa=True
     ):
+        """
+        Initialize the CrossAttention module.
+
+        Args:
+            dim (int): The number of input and output channels.
+            num_heads (int, optional): The number of attention heads. Default is 12.
+            qkv_bias (bool, optional): If True, use bias terms in the query, key, and value projection layers. Default is False.
+            use_sdpa (bool, optional): If True, use scaled dot-product attention. Default is True.
+        """
+
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -138,6 +225,18 @@ class CrossAttention(nn.Module):
         self.use_sdpa = use_sdpa
 
     def forward(self, q, x):
+        """
+        Forward pass through the CrossAttention module.
+
+        Args:
+            q (torch.Tensor): Input tensor of shape (B, n, C), where B is the batch size, 
+                n is the query length, and C is the feature dimension.
+            x (torch.Tensor): Input tensor of shape (B, N, C), where B is the batch size, 
+                N is the sequence length, and C is the feature dimension.
+
+        Returns:
+            torch.Tensor: Output tensor after applying cross-attention, of shape (B, n, C).
+        """
         B, n, C = q.shape
         q = self.q(q).reshape(B, n, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
 
@@ -169,6 +268,18 @@ class CrossAttentionBlock(nn.Module):
         act_layer=nn.GELU,
         norm_layer=nn.LayerNorm
     ):
+        """
+        Initialize CrossAttentionBlock.
+        Args:
+            dim (int): The number of input and output dimensions.
+            num_heads (int): The number of attention heads.
+            mlp_ratio (float): The ratio of the number of channels in the MLP
+                (hidden layer) to the embedding dimension.
+            qkv_bias (bool): Whether to add a bias term to the query, key, and value
+                projection layers.
+            act_layer (nn.Module): The activation layer to use.
+            norm_layer (nn.Module): The normalization layer to use.
+        """
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.xattn = CrossAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias)
@@ -177,6 +288,19 @@ class CrossAttentionBlock(nn.Module):
         self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer)
 
     def forward(self, q, x):
+        """
+        Forward pass through the CrossAttentionBlock.
+
+        Args:
+            q (torch.Tensor): Input tensor of shape (B, n, C), where B is the batch size, 
+                n is the query length, and C is the feature dimension.
+            x (torch.Tensor): Input tensor of shape (B, N, C), where B is the batch size, 
+                N is the sequence length, and C is the feature dimension.
+
+        Returns:
+            torch.Tensor: Output tensor after applying cross-attention and MLP, of shape (B, n, C).
+        """
+
         y = self.xattn(q, self.norm1(x))
         q = q + y
         q = q + self.mlp(self.norm2(q))

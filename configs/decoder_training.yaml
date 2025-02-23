@@ -38,6 +38,10 @@ data_aug:
   - 1.0
   reprob: 0.0. 
 
+loss:
+  loss_exp: 1.0
+  reg_coeff: 0.0
+  
 mask:
   - aspect_ratio:
       - 0.75
