@@ -264,6 +264,8 @@ class VJEPADecoderTrainer:
 
         # Get predictor's output dimension
         predictor_out_dim = self.predictor.backbone.predictor_proj.out_features
+        encoder_depth = self.encoder.backbone.depth
+        encoder_heads = self.encoder.backbone.heads
 
         # Create kwargs with matching configuration
         decoder_kwargs = {
@@ -274,11 +276,11 @@ class VJEPADecoderTrainer:
             'in_chans': 3,
             'embed_dim': predictor_out_dim,  # Input dimension matches predictor output
             'decoder_embed_dim': self.config['model'].get('decoder_embed_dim', predictor_out_dim),  # Usually smaller
-            'depth': self.config['model'].get('decoder_depth', 12),
-            'num_heads': self.config['model'].get('decoder_heads', 12),
+            'depth': self.config['model'].get('decoder_depth', encoder_depth),
+            'num_heads': self.config['model'].get('decoder_heads', encoder_heads),
         }
 
-        decoder = video_vitd.__dict__[model_cfg['decoder_type']](**decoder_kwargs)
+        decoder = video_vitd.__dict__[model_cfg['model_name']](**decoder_kwargs)
         return decoder.to(self.device)
 
     def _load_checkpoint(self, checkpoint_path):
@@ -416,6 +418,7 @@ class VJEPADecoderTrainer:
                 else:
                     loss.backward()
                 
+                _dec_norm = 0
                 if self.config['optimization']['clip_grad'] is not None:
                     _dec_norm = torch.nn.utils.clip_grad_norm_(
                         self.decoder.parameters(), 
@@ -534,75 +537,131 @@ class VJEPADecoderTrainer:
         return val_loss
     
     def _log_visualizations(self, video, decoded_frames_list, masks_pred_list, name):
-        """Create and log visualization grids showing context, predictions, and ground truth for multiple masks
-    
+        """Create and log visualization grids showing context, predictions, and ground truth for 2-3 random masks.
+        For each randomly selected mask, the montage displays a temporal grid with up to 4 frames from the
+        context video (groundtruth with masked regions zeroed), the decoded predictions, and the ground truth.
+
         Args:
-            video: Original video tensor (B,C,T,H,W)
+            video: Original video tensor (B, C, T, H, W)
             decoded_frames_list: List of predicted frames tensors for each mask
-            masks_pred_list: List of predictor masks indicating masked regions
+            masks_pred_list: List of binary masks (or tensors convertible to binary) indicating masked regions
             name: Name for logging
         """
         if not self.config['logging']['use_wandb']:
             return
-            
-        # Convert to numpy and move channels last
+        
         def prep_for_vis(tensor):
-            return tensor.cpu().detach().numpy().transpose(0, 2, 3, 4, 1)  # (B,T,H,W,C)
+            # Convert tensor to numpy of shape (B, T, H, W, C)
+            return tensor.cpu().detach().numpy().transpose(0, 2, 3, 4, 1)
         
-        # Select random subset of masks to visualize (2-3 masks)
-        num_masks = min(3, len(masks_pred_list))
-        mask_indices = torch.randperm(len(masks_pred_list))[:num_masks]
+        # Convert the video to numpy format
+        video_np = prep_for_vis(video)  # shape: (B, T, H, W, C)
+        B, T, H, W, C = video_np.shape
+        logger.debug(f"_log_visualizations: video_np shape: {video_np.shape}")
         
-        video_np = prep_for_vis(video)
+        # Determine valid length for masks and decoded frames
+        valid_length = min(len(masks_pred_list), len(decoded_frames_list))
+        if valid_length == 0:
+            logger.warning("No valid masks or decoded frames available for visualization.")
+            return
+        logger.debug(f"_log_visualizations: valid_length = {valid_length}")
         
-        for idx, mask_idx in enumerate(mask_indices):
-            mask_pred = masks_pred_list[mask_idx]
-            decoded_frame = decoded_frames_list[mask_idx]
-            pred_np = prep_for_vis(decoded_frame)
+        # Select 2-3 random indices from the valid length
+        num_to_select = min(3, valid_length)
+        mask_indices = torch.randperm(valid_length)[:num_to_select]
+        logger.debug(f"_log_visualizations: selected mask indices = {mask_indices.tolist()}")
+        
+        for idx in mask_indices:
+            idx = idx.item()
+            mask_pred = masks_pred_list[idx]
+            # Use corresponding decoded frame if available
+            decoded_frame = decoded_frames_list[idx]
             
-            # Create context version (original video with masked regions zeroed)
-            context_video = video.clone()
-            B, C, T, H, W = video.shape
-            flat_size = T * H * W
+            # Convert prediction to numpy; expecting shape (B, T, H, W, C) ideally.
+            pred_np = prep_for_vis(decoded_frame)  # shape: (B, T, H, W, C)
+            logger.debug(f"Mask index {idx}: pred_np shape: {pred_np.shape}")
             
-            # Create binary mask of same shape as video
-            binary_mask = torch.ones((B, 1, flat_size), device=video.device)
-            binary_mask.scatter_(2, mask_pred.unsqueeze(0).unsqueeze(0), 0)
-            binary_mask = binary_mask.view(B, 1, T, H, W)
-            binary_mask = binary_mask.expand(-1, C, -1, -1, -1)
+            # Process the mask, assume it is binary; if it has a batch dimension, take the first sample
+            if mask_pred.dim() == 4:  # (B, T, H, W)
+                mask_np = mask_pred[0].cpu().detach().numpy()  # shape: (T, H, W)
+            else:
+                mask_np = mask_pred.cpu().detach().numpy()  # shape: (T, H, W)
             
-            # Apply mask to get context
-            context_video = context_video * binary_mask
-            context_np = prep_for_vis(context_video)
+            logger.debug(f"Mask index {idx}: raw mask_np shape: {mask_np.shape}")
             
-            # Take first item from batch and first frame
-            # Stack horizontally: [context | prediction | ground truth]
-            grid = np.concatenate([
-                context_np[0, 0],    # First frame of context (masked input)
-                pred_np[0, 0],       # First frame of prediction
-                video_np[0, 0]       # First frame of ground truth
-            ], axis=1)
+            # Ensure the mask is binary: if not boolean and max>1, threshold it.
+            if mask_np.dtype != np.bool_ and mask_np.max() > 1:
+                mask_np = (mask_np > 0.5).astype(np.float32)
+            else:
+                mask_np = mask_np.astype(np.float32)
+            logger.debug(f"Mask index {idx}: mask_np after thresholding, shape: {mask_np.shape}, dtype: {mask_np.dtype}")
             
-            # Log to wandb with mask index
+            # If the mask is 2D, assume it is spatial-only and replicate it along time
+            if mask_np.ndim == 2:
+                logger.debug(f"Mask index {idx}: Detected 2D mask. Replicating across time.")
+                mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0)  # shape (1,1, h, w)
+                # Resize spatially to video resolution (H, W)
+                resized_mask = F.interpolate(mask_tensor, size=(H, W), mode='nearest')
+                # Replicate across T frames
+                resized_mask = resized_mask.repeat(T, 1, 1, 1)  # shape (T, 1, H, W)
+                mask_np_resized = resized_mask.squeeze(1).cpu().numpy()  # shape: (T, H, W)
+            elif mask_np.ndim == 3:
+                # Expecting shape (T_in, h, w). If T_in does not match video T or spatial dims differ,
+                # resize to (T, H, W) using torch's interpolation.
+                if mask_np.shape != (T, H, W):
+                    logger.debug(f"Mask index {idx}: Resizing mask from {mask_np.shape} to ({T}, {H}, {W})")
+                    mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0)  # shape (1,1,T_in,h,w)
+                    resized_mask = F.interpolate(mask_tensor, size=(T, H, W), mode='nearest')
+                    mask_np_resized = resized_mask.squeeze(0).squeeze(0).cpu().numpy()  # shape (T, H, W)
+                else:
+                    mask_np_resized = mask_np
+            else:
+                logger.warning(f"Mask index {idx}: Unexpected mask dimensions {mask_np.ndim}; skipping visualization.")
+                continue
+            
+            logger.debug(f"Mask index {idx}: resized mask shape: {mask_np_resized.shape}")
+            
+            # Create binary mask for visualization: invert mask so that masked regions are 0
+            binary_mask = 1 - mask_np_resized[..., None]  # shape: (T, H, W, 1)
+            logger.debug(f"Mask index {idx}: binary_mask shape: {binary_mask.shape}")
+            
+            # Create context video by zeroing out masked regions in the ground truth video (first sample only)
+            context_np = video_np[0] * binary_mask  # shape: (T, H, W, C)
+            logger.debug(f"Mask index {idx}: context_np shape: {context_np.shape}")
+            
+            # Select a few frames (up to 4) for visualization
+            num_frames_to_show = min(4, T)
+            frame_indices = np.linspace(0, T - 1, num_frames_to_show, dtype=int)
+            
+            # For each modality, horizontally stack the selected frames
+            context_row = np.concatenate([context_np[t] for t in frame_indices], axis=1)
+            pred_row = np.concatenate([pred_np[0, t] for t in frame_indices], axis=1)
+            gt_row = np.concatenate([video_np[0, t] for t in frame_indices], axis=1)
+            
+            # Vertically stack the rows so that the final montage has 3 rows:
+            # Row 1: Context, Row 2: Prediction, Row 3: Ground Truth
+            montage = np.concatenate([context_row, pred_row, gt_row], axis=0)
+            logger.debug(f"Mask index {idx}: montage shape: {montage.shape}")
+            
             wandb.log({
                 f"{name}_mask_{idx}": wandb.Image(
-                    grid, 
-                    caption=f"Mask {idx}: Context | Prediction | Ground Truth"
+                    montage, 
+                    caption=f"Mask {idx}: Top - Context (masked GT), Middle - Prediction, Bottom - Ground Truth"
                 )
             })
             
-            # Optionally log temporal visualization (e.g., first 4 frames)
+            # Additionally, if desired, log a temporal grid (if T > 1) that stacks frames vertically for each modality
             if T > 1:
                 temporal_grid = np.concatenate([
-                    np.concatenate([context_np[0, t] for t in range(min(4, T))], axis=1),
-                    np.concatenate([pred_np[0, t] for t in range(min(4, T))], axis=1),
-                    np.concatenate([video_np[0, t] for t in range(min(4, T))], axis=1)
+                    np.concatenate([context_np[t] for t in frame_indices], axis=1),
+                    np.concatenate([pred_np[0, t] for t in frame_indices], axis=1),
+                    np.concatenate([video_np[0, t] for t in frame_indices], axis=1)
                 ], axis=0)
                 
                 wandb.log({
                     f"{name}_temporal_mask_{idx}": wandb.Image(
                         temporal_grid,
-                        caption=f"Mask {idx} Temporal: Context | Prediction | Ground Truth"
+                        caption=f"Mask {idx} Temporal: Top - Context, Middle - Prediction, Bottom - Ground Truth"
                     )
                 })
     

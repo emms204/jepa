@@ -121,7 +121,7 @@ class VisionTransformerDecoder(nn.Module):
         if self.is_video:
             self.patch_proj = nn.Sequential(
                 # First project to intermediate dimension
-                nn.Linear(decoder_embed_dim * 2, patch_dim),
+                nn.Linear(decoder_embed_dim, patch_dim),
                 # Reshape layer will be in forward pass
                 nn.ConvTranspose3d(
                     in_channels=patch_dim // (patch_size * patch_size * tubelet_size),  # Should equal in_chans
@@ -133,7 +133,7 @@ class VisionTransformerDecoder(nn.Module):
         else:
             self.patch_proj = nn.Sequential(
                 # First project to intermediate dimension
-                nn.Linear(decoder_embed_dim * 2, patch_dim),
+                nn.Linear(decoder_embed_dim, patch_dim),
                 # Reshape layer will be in forward pass
                 nn.ConvTranspose2d(
                     in_channels=patch_dim // (patch_size * patch_size),  # Should equal in_chans
@@ -368,11 +368,11 @@ class VisionTransformerDecoder(nn.Module):
 
         # Add positional embedding
         if self.pos_embed is not None:
-            ctxt_pos_embed = self.interpolate_pos_encoding(ctxt_tokens, self.pos_embed)
-            ctxt_tokens += apply_masks(ctxt_pos_embed, masks_ctxt)
+            # ctxt_pos_embed = self.interpolate_pos_encoding(ctxt_tokens, self.pos_embed)
+            ctxt_tokens += apply_masks(self.pos_embed, masks_ctxt)
             
-            tgt_pos_embed = self.interpolate_pos_encoding(tgt_tokens, self.pos_embed)
-            tgt_tokens += apply_masks(tgt_pos_embed, masks_tgt)
+            # tgt_pos_embed = self.interpolate_pos_encoding(tgt_tokens, self.pos_embed)
+            tgt_tokens += apply_masks(self.pos_embed, masks_tgt)
             logger.debug("Added positional embeddings to tokens")
 
         # Concatenate tokens
@@ -380,8 +380,8 @@ class VisionTransformerDecoder(nn.Module):
         logger.debug(f"Concatenated tokens shape: {x.shape}")
 
         # Process masks
-        masks_ctxt = torch.cat(masks_ctxt, dim=0)
-        masks_tgt = torch.cat(masks_tgt, dim=0)
+        # masks_ctxt = torch.cat(masks_ctxt, dim=0)
+        # masks_tgt = torch.cat(masks_tgt, dim=0)
         masks = torch.cat([masks_ctxt, masks_tgt], dim=1)
         logger.debug(f"Combined masks shape: {masks.shape}")
 
@@ -398,19 +398,34 @@ class VisionTransformerDecoder(nn.Module):
             logger.debug(f"After normalization shape: {x.shape}")
 
         # Project to patch dimension
-        x = self.patch_proj[0](x)
+        x = self.patch_proj[0](x)  # Shape: [24, 1232, 1536]
         logger.debug(f"After initial projection shape: {x.shape}")
-
-        # Reshape and apply transposed convolution
+        
         if self.num_frames > 1:
             B, N, C = x.shape
-            T = self.num_frames // self.tubelet_size
-            H = W = self.img_size // self.patch_size
+            T = self.num_frames // self.tubelet_size  # 8
+            H = W = self.img_size // self.patch_size  # 14
             
+            # Calculate expected sequence length
+            expected_seq_len = T * H * W  # 8 * 14 * 14 = 1568
+            
+            if N != expected_seq_len:
+                logger.warning(f"Sequence length mismatch. Got {N}, expected {expected_seq_len}")
+                # We need to either pad or truncate to match expected sequence length
+                if N < expected_seq_len:
+                    # Pad with zeros
+                    pad_len = expected_seq_len - N
+                    x = torch.cat([x, torch.zeros(B, pad_len, C, device=x.device)], dim=1)
+                else:
+                    # Truncate
+                    x = x[:, :expected_seq_len, :]
+            
+            # Now reshape should work
             x = x.reshape(B, T, H, W, -1)
-            x = x.permute(0, 4, 1, 2, 3)
+            x = x.permute(0, 4, 1, 2, 3)  # [B, C, T, H, W]
             logger.debug(f"Reshaped for 3D conv shape: {x.shape}")
             
+            # Apply transposed convolution
             x = self.patch_proj[1](x)
             logger.debug(f"Final output shape (video): {x.shape}")
         else:
