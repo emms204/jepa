@@ -1,3 +1,5 @@
 .*.swp
 *.pyc
 .specstory/history
+build/lib
+dist
