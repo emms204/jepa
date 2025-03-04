@@ -1,5 +1,8 @@
 import torch
 import torch.nn as nn
+from einops.layers.torch import Rearrange
+from einops import rearrange
+import torch.nn.functional as F
 import math
 import logging
 
@@ -9,7 +12,9 @@ from src.models.utils.pos_embs import get_2d_sincos_pos_embed, get_3d_sincos_pos
 from src.utils.tensors import trunc_normal_
 from src.masks.utils import apply_masks
 from functools import partial
+from src.utils.logging import get_logger
 
+logging.basicConfig(level=logging.INFO, force=True)  # or logging.DEBUG for more detail
 logger = logging.getLogger(__name__)
 
 class VisionTransformerDecoder(nn.Module):
@@ -121,7 +126,7 @@ class VisionTransformerDecoder(nn.Module):
         if self.is_video:
             self.patch_proj = nn.Sequential(
                 # First project to intermediate dimension
-                nn.Linear(decoder_embed_dim, patch_dim),
+                nn.Linear(decoder_embed_dim, in_chans),
                 # Reshape layer will be in forward pass
                 nn.ConvTranspose3d(
                     in_channels=patch_dim // (patch_size * patch_size * tubelet_size),  # Should equal in_chans
@@ -133,7 +138,7 @@ class VisionTransformerDecoder(nn.Module):
         else:
             self.patch_proj = nn.Sequential(
                 # First project to intermediate dimension
-                nn.Linear(decoder_embed_dim, patch_dim),
+                nn.Linear(decoder_embed_dim, in_chans),
                 # Reshape layer will be in forward pass
                 nn.ConvTranspose2d(
                     in_channels=patch_dim // (patch_size * patch_size),  # Should equal in_chans
@@ -398,7 +403,7 @@ class VisionTransformerDecoder(nn.Module):
             logger.debug(f"After normalization shape: {x.shape}")
 
         # Project to patch dimension
-        x = self.patch_proj[0](x)  # Shape: [24, 1232, 1536]
+        x = self.patch_proj[0](x)  # Linear projection
         logger.debug(f"After initial projection shape: {x.shape}")
         
         if self.num_frames > 1:
@@ -410,7 +415,7 @@ class VisionTransformerDecoder(nn.Module):
             expected_seq_len = T * H * W  # 8 * 14 * 14 = 1568
             
             if N != expected_seq_len:
-                logger.warning(f"Sequence length mismatch. Got {N}, expected {expected_seq_len}")
+                logger.debug(f"Sequence length mismatch. Got {N}, expected {expected_seq_len}")
                 # We need to either pad or truncate to match expected sequence length
                 if N < expected_seq_len:
                     # Pad with zeros
@@ -443,12 +448,10 @@ class VisionTransformerDecoder(nn.Module):
             return x, intermediates
         return x
 
+
 def vit_tiny(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
         patch_size=patch_size, 
-        embed_dim=192, 
-        depth=12, 
-        num_heads=3, 
         mlp_ratio=4,
         qkv_bias=True, 
         norm_layer=partial(nn.LayerNorm, eps=1e-6), 
@@ -458,9 +461,6 @@ def vit_tiny(patch_size=16, **kwargs):
 def vit_small(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
         patch_size=patch_size, 
-        embed_dim=384, 
-        depth=12, 
-        num_heads=6, 
         mlp_ratio=4,
         qkv_bias=True, 
         norm_layer=partial(nn.LayerNorm, eps=1e-6), 
@@ -470,9 +470,6 @@ def vit_small(patch_size=16, **kwargs):
 def vit_base(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
         patch_size=patch_size, 
-        embed_dim=768, 
-        depth=12, 
-        num_heads=12, 
         mlp_ratio=4,
         qkv_bias=True, 
         norm_layer=partial(nn.LayerNorm, eps=1e-6), 
@@ -481,10 +478,7 @@ def vit_base(patch_size=16, **kwargs):
 
 def vit_large(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
-        patch_size=patch_size, 
-        embed_dim=1024, 
-        depth=24, 
-        num_heads=16, 
+        patch_size=patch_size,  
         mlp_ratio=4,
         qkv_bias=True, 
         norm_layer=partial(nn.LayerNorm, eps=1e-6), 
@@ -494,9 +488,6 @@ def vit_large(patch_size=16, **kwargs):
 def vit_huge(patch_size=16, **kwargs):
     return VisionTransformerDecoder(
         patch_size=patch_size, 
-        embed_dim=1280, 
-        depth=32, 
-        num_heads=16, 
         mlp_ratio=4,
         qkv_bias=True, 
         norm_layer=partial(nn.LayerNorm, eps=1e-6), 

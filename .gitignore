@@ -3,3 +3,4 @@
 .specstory/history
 build/lib
 dist
+src/jepa.egg-info

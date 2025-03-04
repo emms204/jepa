@@ -127,4 +127,4 @@ def init_data(
             drop_last=drop_last,
             log_dir=log_dir)
 
-    return (data_loader, dist_sampler)
+    return (dataset, data_loader, dist_sampler)

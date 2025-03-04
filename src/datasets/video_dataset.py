@@ -175,22 +175,12 @@ class VideoDataset(torch.utils.data.Dataset):
         # Load video paths and labels
         samples, labels = [], []
         self.num_samples_per_dataset = []
-        for data_path in self.data_paths:
-
-            if data_path[-4:] == '.csv':
-                data = pd.read_csv(data_path, header=None, delimiter=" ")
-                samples += list(data.values[:, 0])
-                labels += list(data.values[:, 1])
-                num_samples = len(data)
-                self.num_samples_per_dataset.append(num_samples)
-
-            elif data_path[-4:] == '.npy':
-                data = np.load(data_path, allow_pickle=True)
-                data = list(map(lambda x: repr(x)[1:-1], data))
-                samples += data
-                labels += [0] * len(data)
-                num_samples = len(data)
-                self.num_samples_per_dataset.append(len(data))
+        
+        data = pd.read_csv(data_paths)
+        samples += list(data.values[:, 0])
+        labels += list(data.values[:, 1])
+        num_samples = len(data)
+        self.num_samples_per_dataset.append(num_samples)
 
         # [Optional] Weights for each sample to be used by downstream
         # weighted video sampler

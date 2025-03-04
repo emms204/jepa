@@ -28,7 +28,8 @@ np.random.seed(_GLOBAL_SEED)
 torch.manual_seed(_GLOBAL_SEED)
 torch.backends.cudnn.benchmark = True
 
-logger = get_logger(__name__)
+logging.basicConfig(level=logging.INFO, force=True)  # or logging.DEBUG for more detail
+logger = logging.getLogger(__name__)
 
 class VJEPADecoderTrainer:
     def __init__(
@@ -47,8 +48,10 @@ class VJEPADecoderTrainer:
         cfgs_meta = self.config.get('meta')
         pretrain_folder = cfgs_meta.get('folder', None)
         ckp_fname = cfgs_meta.get('checkpoint', None)
+        dckp_fname = cfgs_meta.get('decoder_checkpoint', None)
         use_sdpa = cfgs_meta.get('use_sdpa', False)
         which_dtype = cfgs_meta.get('dtype')
+        self.best_val_loss = None
         
         logger.info(f"Loading checkpoint from: {os.path.join(pretrain_folder, ckp_fname)}")
         logger.info(f"Using SDPA: {use_sdpa}, dtype: {which_dtype}")
@@ -68,6 +71,7 @@ class VJEPADecoderTrainer:
         logger.info(f"Using dtype: {dtype}, mixed precision: {mixed_precision}")
 
         pretrained_path = os.path.join(pretrain_folder, ckp_fname)
+        decoder_ckpt = os.path.join(pretrain_folder, dckp_fname)
 
         # -- MASK
         cfgs_mask = self.config.get('mask')
@@ -152,12 +156,11 @@ class VJEPADecoderTrainer:
         # Models
         self.encoder = encoder.to(device)
         self.predictor = predictor.to(device)
-        
-        logger.info("Loading pretrained weights")
-        self._load_checkpoint(pretrained_path)
-        
         logger.info("Initializing decoder")
         self.decoder = self._init_decoder()
+        
+        logger.info("Loading pretrained weights")
+        self._load_checkpoint(pretrained_path, decoder_ckpt)
         
         # Freeze encoder and predictor
         logger.info("Freezing encoder and predictor parameters")
@@ -193,7 +196,7 @@ class VJEPADecoderTrainer:
             crop_size=crop_size)
 
         # Initialize datasets and dataloaders
-        train_dataset, train_loader = init_data(
+        train_dataset, train_loader, train_sampler = init_data(
             data='videodataset',
             root_path=train_path,
             batch_size=batch_size,
@@ -208,14 +211,14 @@ class VJEPADecoderTrainer:
             datasets_weights=datasets_weights,
             collator=mask_collator,
             num_workers=num_workers,
-            world_size=0,
+            world_size=1,
             rank=0,
             pin_mem=pin_mem,
             log_dir=None
         )
         self.train_loader = train_loader
 
-        val_dataset, val_loader = init_data(
+        val_dataset, val_loader, val_sampler = init_data(
             data='videodataset',
             root_path=val_path,
             batch_size=batch_size,
@@ -230,7 +233,7 @@ class VJEPADecoderTrainer:
             datasets_weights=datasets_weights,
             collator=mask_collator,
             num_workers=num_workers,
-            world_size=0,
+            world_size=1,
             rank=0,
             pin_mem=pin_mem,
             log_dir=None
@@ -264,8 +267,7 @@ class VJEPADecoderTrainer:
 
         # Get predictor's output dimension
         predictor_out_dim = self.predictor.backbone.predictor_proj.out_features
-        encoder_depth = self.encoder.backbone.depth
-        encoder_heads = self.encoder.backbone.heads
+        encoder_heads = self.encoder.backbone.num_heads
 
         # Create kwargs with matching configuration
         decoder_kwargs = {
@@ -276,14 +278,14 @@ class VJEPADecoderTrainer:
             'in_chans': 3,
             'embed_dim': predictor_out_dim,  # Input dimension matches predictor output
             'decoder_embed_dim': self.config['model'].get('decoder_embed_dim', predictor_out_dim),  # Usually smaller
-            'depth': self.config['model'].get('decoder_depth', encoder_depth),
+            'depth': self.config['model'].get('pred_depth', 12),
             'num_heads': self.config['model'].get('decoder_heads', encoder_heads),
         }
 
         decoder = video_vitd.__dict__[model_cfg['model_name']](**decoder_kwargs)
         return decoder.to(self.device)
 
-    def _load_checkpoint(self, checkpoint_path):
+    def _load_checkpoint(self, checkpoint_path, decoder_ckpt=None):
         """Load trained weights from checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         pretrained_dict = checkpoint['encoder']
@@ -315,6 +317,13 @@ class VJEPADecoderTrainer:
         # logger.info(f'loaded pretrained model with msg: {msg}')
         logger.info(f'loaded pretrained predictor from epoch: {checkpoint["epoch"]}\n path: {checkpoint_path}')
         
+        if decoder_ckpt:
+            checkpoint = torch.load(decoder_ckpt, map_location=self.device)
+            pretrained_dict = checkpoint['decoder_state_dict']
+            msg = self.decoder.load_state_dict(pretrained_dict, strict=False)
+            self.best_val_loss = checkpoint['val_loss']
+        
+        logger.info(f'loaded pretrained decoder from epoch: {checkpoint["epoch"]}\n and best val loss: {self.best_val_loss} path: {decoder_ckpt}')
         # self.target_encoder.load_state_dict(checkpoint['target_encoder'])
         # self.decoder.load_state_dict(checkpoint['decoder'])
     
@@ -362,17 +371,16 @@ class VJEPADecoderTrainer:
                 with torch.no_grad():
                     logger.debug("Computing encoder embeddings")
                     context_embeddings = self.encoder(clips, masks_enc)
-                    logger.debug(f"Context embeddings shape: {context_embeddings.shape}")
+                    logger.debug(f"Length of Context Embeddings: {len(context_embeddings)} Context embeddings shape: {context_embeddings[0].shape}")
                     
                     logger.debug("Computing predictor embeddings")
                     predicted_embeddings = self.predictor(
                         ctxt=context_embeddings,
                         tgt=None,
                         masks_ctxt=masks_enc,
-                        masks_tgt=masks_pred,
-                        mask_index=0
+                        masks_tgt=masks_pred
                     )
-                    logger.debug(f"Predicted embeddings shape: {predicted_embeddings.shape}")
+                    logger.debug(f"Length of Predicted Embeddings: {len(predicted_embeddings)} Predicted embeddings shape: {predicted_embeddings[0].shape}")
                 
                 # Decode predictions
                 with torch.cuda.amp.autocast(dtype=self.dtype, enabled=self.mixed_precision):
@@ -418,7 +426,6 @@ class VJEPADecoderTrainer:
                 else:
                     loss.backward()
                 
-                _dec_norm = 0
                 if self.config['optimization']['clip_grad'] is not None:
                     _dec_norm = torch.nn.utils.clip_grad_norm_(
                         self.decoder.parameters(), 
@@ -450,7 +457,7 @@ class VJEPADecoderTrainer:
                 
                 # Visualize occasionally
                 if batch_idx % self.config['logging']['vis_interval'] == 0:
-                    logger.info(f"Creating visualizations for batch {batch_idx}")
+                    logger.debug(f"Creating visualizations for batch {batch_idx}")
                     self._log_visualizations(
                         clips,
                         decoded_frames_list,
@@ -483,8 +490,7 @@ class VJEPADecoderTrainer:
                     ctxt=context_embeddings,
                     tgt=None,
                     masks_ctxt=masks_enc,
-                    masks_tgt=masks_pred,
-                    mask_index=0
+                    masks_tgt=masks_pred
                 )
                 
                 # Decode predictions
@@ -517,7 +523,7 @@ class VJEPADecoderTrainer:
                 
                 # Visualize occasionally
                 if batch_idx % self.config['logging']['vis_interval'] == 0:
-                    logger.info(f"Creating validation visualizations for batch {batch_idx}")
+                    logger.debug(f"Creating validation visualizations for batch {batch_idx}")
                     self._log_visualizations(
                         clips,
                         decoded_frames_list,
@@ -537,137 +543,179 @@ class VJEPADecoderTrainer:
         return val_loss
     
     def _log_visualizations(self, video, decoded_frames_list, masks_pred_list, name):
-        """Create and log visualization grids showing context, predictions, and ground truth for 2-3 random masks.
-        For each randomly selected mask, the montage displays a temporal grid with up to 4 frames from the
-        context video (groundtruth with masked regions zeroed), the decoded predictions, and the ground truth.
+        """Create and log visualization grids showing only decoded predictions for 4 frames
+        from a random subset of the predictions corresponding to masks_pred indices.
 
         Args:
-            video: Original video tensor (B, C, T, H, W)
-            decoded_frames_list: List of predicted frames tensors for each mask
-            masks_pred_list: List of binary masks (or tensors convertible to binary) indicating masked regions
-            name: Name for logging
+            video: Original video tensor (B, C, T, H, W) [not used in this visualization].
+            decoded_frames_list: List of predicted frame tensors for each mask,
+                                 each tensor of shape (B, C, T, H, W)
+            masks_pred_list: List of predictor masks (not used here directly).
+            name: Name for logging.
         """
         if not self.config['logging']['use_wandb']:
             return
-        
+
         def prep_for_vis(tensor):
-            # Convert tensor to numpy of shape (B, T, H, W, C)
+            # Convert tensor from (B, C, T, H, W) to (B, T, H, W, C) for visualization
             return tensor.cpu().detach().numpy().transpose(0, 2, 3, 4, 1)
-        
-        # Convert the video to numpy format
-        video_np = prep_for_vis(video)  # shape: (B, T, H, W, C)
-        B, T, H, W, C = video_np.shape
-        logger.debug(f"_log_visualizations: video_np shape: {video_np.shape}")
-        
-        # Determine valid length for masks and decoded frames
-        valid_length = min(len(masks_pred_list), len(decoded_frames_list))
-        if valid_length == 0:
-            logger.warning("No valid masks or decoded frames available for visualization.")
-            return
-        logger.debug(f"_log_visualizations: valid_length = {valid_length}")
-        
-        # Select 2-3 random indices from the valid length
-        num_to_select = min(3, valid_length)
-        mask_indices = torch.randperm(valid_length)[:num_to_select]
-        logger.debug(f"_log_visualizations: selected mask indices = {mask_indices.tolist()}")
-        
+
+        # Select a random subset (up to 3) of indices from the decoded predictions list.
+        num_masks = len(decoded_frames_list)
+        num_select = min(3, num_masks)
+        mask_indices = torch.randperm(num_masks)[:num_select]
+
+        # Pre-compute numpy arrays for the predictions.
+        predictions_np = [prep_for_vis(pred) for pred in decoded_frames_list]
+
         for idx in mask_indices:
             idx = idx.item()
-            mask_pred = masks_pred_list[idx]
-            # Use corresponding decoded frame if available
-            decoded_frame = decoded_frames_list[idx]
-            
-            # Convert prediction to numpy; expecting shape (B, T, H, W, C) ideally.
-            pred_np = prep_for_vis(decoded_frame)  # shape: (B, T, H, W, C)
-            logger.debug(f"Mask index {idx}: pred_np shape: {pred_np.shape}")
-            
-            # Process the mask, assume it is binary; if it has a batch dimension, take the first sample
-            if mask_pred.dim() == 4:  # (B, T, H, W)
-                mask_np = mask_pred[0].cpu().detach().numpy()  # shape: (T, H, W)
-            else:
-                mask_np = mask_pred.cpu().detach().numpy()  # shape: (T, H, W)
-            
-            logger.debug(f"Mask index {idx}: raw mask_np shape: {mask_np.shape}")
-            
-            # Ensure the mask is binary: if not boolean and max>1, threshold it.
-            if mask_np.dtype != np.bool_ and mask_np.max() > 1:
-                mask_np = (mask_np > 0.5).astype(np.float32)
-            else:
-                mask_np = mask_np.astype(np.float32)
-            logger.debug(f"Mask index {idx}: mask_np after thresholding, shape: {mask_np.shape}, dtype: {mask_np.dtype}")
-            
-            # If the mask is 2D, assume it is spatial-only and replicate it along time
-            if mask_np.ndim == 2:
-                logger.debug(f"Mask index {idx}: Detected 2D mask. Replicating across time.")
-                mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0)  # shape (1,1, h, w)
-                # Resize spatially to video resolution (H, W)
-                resized_mask = F.interpolate(mask_tensor, size=(H, W), mode='nearest')
-                # Replicate across T frames
-                resized_mask = resized_mask.repeat(T, 1, 1, 1)  # shape (T, 1, H, W)
-                mask_np_resized = resized_mask.squeeze(1).cpu().numpy()  # shape: (T, H, W)
-            elif mask_np.ndim == 3:
-                # Expecting shape (T_in, h, w). If T_in does not match video T or spatial dims differ,
-                # resize to (T, H, W) using torch's interpolation.
-                if mask_np.shape != (T, H, W):
-                    logger.debug(f"Mask index {idx}: Resizing mask from {mask_np.shape} to ({T}, {H}, {W})")
-                    mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0)  # shape (1,1,T_in,h,w)
-                    resized_mask = F.interpolate(mask_tensor, size=(T, H, W), mode='nearest')
-                    mask_np_resized = resized_mask.squeeze(0).squeeze(0).cpu().numpy()  # shape (T, H, W)
-                else:
-                    mask_np_resized = mask_np
-            else:
-                logger.warning(f"Mask index {idx}: Unexpected mask dimensions {mask_np.ndim}; skipping visualization.")
-                continue
-            
-            logger.debug(f"Mask index {idx}: resized mask shape: {mask_np_resized.shape}")
-            
-            # Create binary mask for visualization: invert mask so that masked regions are 0
-            binary_mask = 1 - mask_np_resized[..., None]  # shape: (T, H, W, 1)
-            logger.debug(f"Mask index {idx}: binary_mask shape: {binary_mask.shape}")
-            
-            # Create context video by zeroing out masked regions in the ground truth video (first sample only)
-            context_np = video_np[0] * binary_mask  # shape: (T, H, W, C)
-            logger.debug(f"Mask index {idx}: context_np shape: {context_np.shape}")
-            
-            # Select a few frames (up to 4) for visualization
+            pred_np = predictions_np[idx]  # shape: (B, T, H, W, C)
+            B, T, H, W, C = pred_np.shape
             num_frames_to_show = min(4, T)
-            frame_indices = np.linspace(0, T - 1, num_frames_to_show, dtype=int)
-            
-            # For each modality, horizontally stack the selected frames
-            context_row = np.concatenate([context_np[t] for t in frame_indices], axis=1)
-            pred_row = np.concatenate([pred_np[0, t] for t in frame_indices], axis=1)
-            gt_row = np.concatenate([video_np[0, t] for t in frame_indices], axis=1)
-            
-            # Vertically stack the rows so that the final montage has 3 rows:
-            # Row 1: Context, Row 2: Prediction, Row 3: Ground Truth
-            montage = np.concatenate([context_row, pred_row, gt_row], axis=0)
-            logger.debug(f"Mask index {idx}: montage shape: {montage.shape}")
-            
+            # Select the first sample from the batch and the first num_frames_to_show frames.
+            frames = [pred_np[0, t] for t in range(num_frames_to_show)]
+            # Horizontally stack the frame images: resulting grid shape (H, num_frames_to_show * W, C)
+            grid = np.concatenate(frames, axis=1)
             wandb.log({
                 f"{name}_mask_{idx}": wandb.Image(
-                    montage, 
-                    caption=f"Mask {idx}: Top - Context (masked GT), Middle - Prediction, Bottom - Ground Truth"
+                    grid,
+                    caption=f"Decoded predictions for mask {idx} - first {num_frames_to_show} frames"
                 )
             })
+    
+#     def _log_visualizations(self, video, decoded_frames_list, masks_pred_list, name):
+#         """Create and log visualization grids showing context, predictions, and ground truth for 2-3 random masks.
+#         For each randomly selected mask, the montage displays a temporal grid with up to 4 frames from the
+#         context video (groundtruth with masked regions zeroed), the decoded predictions, and the ground truth.
+
+#         Args:
+#             video: Original video tensor (B, C, T, H, W)
+#             decoded_frames_list: List of predicted frames tensors for each mask
+#             masks_pred_list: List of binary masks (or tensors convertible to binary) indicating masked regions
+#             name: Name for logging
+#         """
+#         if not self.config['logging']['use_wandb']:
+#             return
+        
+#         def prep_for_vis(tensor):
+#             # Convert tensor to numpy of shape (B, T, H, W, C)
+#             return tensor.cpu().detach().numpy().transpose(0, 2, 3, 4, 1)
+        
+#         # Convert the video to numpy format
+#         video_np = prep_for_vis(video)  # shape: (B, T, H, W, C)
+#         B, T, H, W, C = video_np.shape
+#         logger.debug(f"_log_visualizations: video_np shape: {video_np.shape}")
+        
+#         # Determine valid length for masks and decoded frames
+#         valid_length = min(len(masks_pred_list), len(decoded_frames_list))
+#         if valid_length == 0:
+#             logger.warning("No valid masks or decoded frames available for visualization.")
+#             return
+#         logger.debug(f"_log_visualizations: valid_length = {valid_length}")
+        
+#         # Select 2-3 random indices from the valid length
+#         num_to_select = min(3, valid_length)
+#         mask_indices = torch.randperm(valid_length)[:num_to_select]
+#         logger.debug(f"_log_visualizations: selected mask indices = {mask_indices.tolist()}")
+        
+#         for idx in mask_indices:
+#             idx = idx.item()
+#             mask_pred = masks_pred_list[idx]
+#             # Use corresponding decoded frame if available
+#             decoded_frame = decoded_frames_list[idx]
             
-            # Additionally, if desired, log a temporal grid (if T > 1) that stacks frames vertically for each modality
-            if T > 1:
-                temporal_grid = np.concatenate([
-                    np.concatenate([context_np[t] for t in frame_indices], axis=1),
-                    np.concatenate([pred_np[0, t] for t in frame_indices], axis=1),
-                    np.concatenate([video_np[0, t] for t in frame_indices], axis=1)
-                ], axis=0)
+#             # Convert prediction to numpy; expecting shape (B, T, H, W, C) ideally.
+#             pred_np = prep_for_vis(decoded_frame)  # shape: (B, T, H, W, C)
+#             logger.debug(f"Mask index {idx}: pred_np shape: {pred_np.shape}")
+            
+#             # Process the mask, assume it is binary; if it has a batch dimension, take the first sample
+#             if mask_pred.dim() == 4:  # (B, T, H, W)
+#                 mask_np = mask_pred[0].cpu().detach().numpy()  # shape: (T, H, W)
+#             else:
+#                 mask_np = mask_pred.cpu().detach().numpy()  # shape: (T, H, W)
+            
+#             logger.debug(f"Mask index {idx}: raw mask_np shape: {mask_np.shape}")
+            
+#             # Ensure the mask is binary: if not boolean and max>1, threshold it.
+#             if mask_np.dtype != np.bool_ and mask_np.max() > 1:
+#                 mask_np = (mask_np > 0.5).astype(np.float32)
+#             else:
+#                 mask_np = mask_np.astype(np.float32)
+#             logger.debug(f"Mask index {idx}: mask_np after thresholding, shape: {mask_np.shape}, dtype: {mask_np.dtype}")
+            
+#             # If the mask is 2D, assume it is spatial-only and replicate it along time
+#             if mask_np.ndim == 2:
+#                 logger.debug(f"Mask index {idx}: Detected 2D mask. Replicating across time.")
+#                 mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0)  # shape (1,1, h, w)
+#                 # Resize spatially to video resolution (H, W)
+#                 resized_mask = F.interpolate(mask_tensor, size=(H, W), mode='nearest')
+#                 # Replicate across T frames
+#                 resized_mask = resized_mask.repeat(T, 1, 1, 1)  # shape (T, 1, H, W)
+#                 mask_np_resized = resized_mask.squeeze(1).cpu().numpy()  # shape: (T, H, W)
+#             elif mask_np.ndim == 3:
+#                 # Expecting shape (T_in, h, w). If T_in does not match video T or spatial dims differ,
+#                 # resize to (T, H, W) using torch's interpolation.
+#                 if mask_np.shape != (T, H, W):
+#                     logger.debug(f"Mask index {idx}: Resizing mask from {mask_np.shape} to ({T}, {H}, {W})")
+#                     mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0)  # shape (1,1,T_in,h,w)
+#                     resized_mask = F.interpolate(mask_tensor, size=(T, H, W), mode='nearest')
+#                     mask_np_resized = resized_mask.squeeze(0).squeeze(0).cpu().numpy()  # shape (T, H, W)
+#                 else:
+#                     mask_np_resized = mask_np
+#             else:
+#                 logger.warning(f"Mask index {idx}: Unexpected mask dimensions {mask_np.ndim}; skipping visualization.")
+#                 continue
+            
+#             logger.debug(f"Mask index {idx}: resized mask shape: {mask_np_resized.shape}")
+            
+#             # Create binary mask for visualization: invert mask so that masked regions are 0
+#             binary_mask = 1 - mask_np_resized[..., None]  # shape: (T, H, W, 1)
+#             logger.debug(f"Mask index {idx}: binary_mask shape: {binary_mask.shape}")
+            
+#             # Create context video by zeroing out masked regions in the ground truth video (first sample only)
+#             context_np = video_np[0] * binary_mask  # shape: (T, H, W, C)
+#             logger.debug(f"Mask index {idx}: context_np shape: {context_np.shape}")
+            
+#             # Select a few frames (up to 4) for visualization
+#             num_frames_to_show = min(4, T)
+#             frame_indices = np.linspace(0, T - 1, num_frames_to_show, dtype=int)
+            
+#             # For each modality, horizontally stack the selected frames
+#             context_row = np.concatenate([context_np[t] for t in frame_indices], axis=1)
+#             pred_row = np.concatenate([pred_np[0, t] for t in frame_indices], axis=1)
+#             gt_row = np.concatenate([video_np[0, t] for t in frame_indices], axis=1)
+            
+#             # Vertically stack the rows so that the final montage has 3 rows:
+#             # Row 1: Context, Row 2: Prediction, Row 3: Ground Truth
+#             montage = np.concatenate([context_row, pred_row, gt_row], axis=0)
+#             logger.debug(f"Mask index {idx}: montage shape: {montage.shape}")
+            
+#             wandb.log({
+#                 f"{name}_mask_{idx}": wandb.Image(
+#                     montage, 
+#                     caption=f"Mask {idx}: Top - Context (masked GT), Middle - Prediction, Bottom - Ground Truth"
+#                 )
+#             })
+            
+#             # Additionally, if desired, log a temporal grid (if T > 1) that stacks frames vertically for each modality
+#             if T > 1:
+#                 temporal_grid = np.concatenate([
+#                     np.concatenate([context_np[t] for t in frame_indices], axis=1),
+#                     np.concatenate([pred_np[0, t] for t in frame_indices], axis=1),
+#                     np.concatenate([video_np[0, t] for t in frame_indices], axis=1)
+#                 ], axis=0)
                 
-                wandb.log({
-                    f"{name}_temporal_mask_{idx}": wandb.Image(
-                        temporal_grid,
-                        caption=f"Mask {idx} Temporal: Top - Context, Middle - Prediction, Bottom - Ground Truth"
-                    )
-                })
+#                 wandb.log({
+#                     f"{name}_temporal_mask_{idx}": wandb.Image(
+#                         temporal_grid,
+#                         caption=f"Mask {idx} Temporal: Top - Context, Middle - Prediction, Bottom - Ground Truth"
+#                     )
+#                 })
     
     def train(self, num_epochs):
         logger.info(f"Starting training for {num_epochs} epochs")
-        best_val_loss = float('inf')
+        best_val_loss = float('inf') if self.best_val_loss is None else self.best_val_loss
         
         for epoch in range(num_epochs):
             train_loss = self.train_epoch(epoch)
@@ -678,7 +726,7 @@ class VJEPADecoderTrainer:
             # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                save_path = f'{self.config["checkpoints"]["path"]}/best_decoder.pth'
+                save_path = '/notebooks/jepa/best_decoder.pth'
                 logger.info(f"New best validation loss: {val_loss:.4f}. Saving model to {save_path}")
                 
                 torch.save({
@@ -687,7 +735,6 @@ class VJEPADecoderTrainer:
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'val_loss': val_loss,
                 }, save_path)
-
 
 if __name__ == "__main__":
     # Load configs
